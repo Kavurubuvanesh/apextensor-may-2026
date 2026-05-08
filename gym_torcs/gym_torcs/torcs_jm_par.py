@@ -425,15 +425,22 @@ LAST_AI_CALL = 0
 CURRENT_STRATEGY = "AGGRESSIVE" 
 RADIO_IS_BUSY = False  
 
-def fetch_strategy_from_cloud(current_speed, track_position):
+# COMMIT 1: Added track_radar and opponent_radar to the pipeline
+def fetch_strategy_from_cloud(current_speed, track_position, track_radar, opponent_radar):
     global CURRENT_STRATEGY, RADIO_IS_BUSY
     
+    # We extract the distance straight ahead (sensor 9) to see if a corner is coming
+    distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
+    
+    # We will upgrade this prompt to a complex JSON reasoning prompt in Commit 2.
+    # For now, we are just testing the telemetry pipeline.
     prompt = f"""
     You are an AI race strategist. 
     The car is traveling at {current_speed} km/h. 
-    Its track position is {track_position} (-1 is left edge, 1 is right edge, 0 is center).
-    If it is near the edge (abs(position) > 0.5), we are entering a corner.
-    Reply with exactly one word: 'AGGRESSIVE' if centered, or 'CONSERVATIVE' if cornering.
+    Track position is {track_position} (-1 is left edge, 1 is right edge, 0 is center).
+    Forward radar shows {distance_ahead} meters of clear track ahead.
+    If the track ahead is less than 80 meters, a sharp corner is approaching.
+    Reply with exactly one word: 'AGGRESSIVE' if clear, or 'CONSERVATIVE' if cornering.
     """
     
     try:
@@ -445,17 +452,17 @@ def fetch_strategy_from_cloud(current_speed, track_position):
         
         if "AGGRESSIVE" in response_text:
             CURRENT_STRATEGY = "AGGRESSIVE"
-            print("\n[PIT-WALL] Radio received: PUSH HARD\n")
+            print(f"\n[PIT-WALL] Radar shows {distance_ahead:.0f}m clear. Radio: PUSH HARD\n")
         elif "CONSERVATIVE" in response_text:
             CURRENT_STRATEGY = "CONSERVATIVE"
-            print("\n[PIT-WALL] Radio received: PLAY IT SAFE\n")
+            print(f"\n[PIT-WALL] Radar shows {distance_ahead:.0f}m clear. Radio: PLAY IT SAFE\n")
             
     except Exception as e:
-        pass # Silently fail so we don't spam the dashboard
+        pass 
     finally:
         RADIO_IS_BUSY = False
 
-def ask_pit_wall_async(current_speed, track_position):
+def ask_pit_wall_async(current_speed, track_position, track_radar, opponent_radar):
     global LAST_AI_CALL, RADIO_IS_BUSY
     current_time = time.time()
     
@@ -465,7 +472,7 @@ def ask_pit_wall_async(current_speed, track_position):
     LAST_AI_CALL = current_time
     RADIO_IS_BUSY = True  
     
-    thread = threading.Thread(target=fetch_strategy_from_cloud, args=(current_speed, track_position))
+    thread = threading.Thread(target=fetch_strategy_from_cloud, args=(current_speed, track_position, track_radar, opponent_radar))
     thread.daemon = True
     thread.start()
 
@@ -505,7 +512,11 @@ def drive_modular(c):
     
     S, R = c.S.d, c.R.d
     
-    ask_pit_wall_async(S.get('speedX', 0), S.get('trackPos', 0))
+    # COMMIT 1: Extract the 19-point track radar and 36-point opponent radar
+    track_radar = S.get('track', [200] * 19)
+    opponent_radar = S.get('opponents', [200] * 36)
+    
+    ask_pit_wall_async(S.get('speedX', 0), S.get('trackPos', 0), track_radar, opponent_radar)
     
     if CURRENT_STRATEGY == "AGGRESSIVE":
         TARGET_SPEED = 140  
