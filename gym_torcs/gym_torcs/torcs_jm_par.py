@@ -6,6 +6,8 @@ import time
 import threading
 import replicate
 import math
+import json
+import re
 from dotenv import load_dotenv
 
 # Load the secret API key from your .env file
@@ -420,42 +422,59 @@ BRAKE_THRESHOLD = 0.5
 GEAR_SPEEDS = [0, 20, 40, 80, 100, 180]  
 ENABLE_TRACTION_CONTROL = True  
 
-# --- PIT-WALL AI STRATEGIST (MULTI-THREADED WITH LOCK) ---
+# --- PIT-WALL AI STRATEGIST (MULTI-THREADED JSON BRAIN) ---
 LAST_AI_CALL = 0  
-CURRENT_STRATEGY = "AGGRESSIVE" 
 RADIO_IS_BUSY = False  
 
-# COMMIT 1: Added track_radar and opponent_radar to the pipeline
+# The dynamic parameters the AI will now control
+CURRENT_STRATEGY_PARAMS = {
+    "TARGET_SPEED": 80,
+    "BRAKE_THRESHOLD": 0.5,
+    "CENTERING_GAIN": 0.5
+}
+
+# COMMIT 2: JSON Reasoning Pipeline
 def fetch_strategy_from_cloud(current_speed, track_position, track_radar, opponent_radar):
-    global CURRENT_STRATEGY, RADIO_IS_BUSY
+    global CURRENT_STRATEGY_PARAMS, RADIO_IS_BUSY
     
-    # We extract the distance straight ahead (sensor 9) to see if a corner is coming
     distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
     
-    # We will upgrade this prompt to a complex JSON reasoning prompt in Commit 2.
-    # For now, we are just testing the telemetry pipeline.
     prompt = f"""
-    You are an AI race strategist. 
-    The car is traveling at {current_speed} km/h. 
-    Track position is {track_position} (-1 is left edge, 1 is right edge, 0 is center).
-    Forward radar shows {distance_ahead} meters of clear track ahead.
-    If the track ahead is less than 80 meters, a sharp corner is approaching.
-    Reply with exactly one word: 'AGGRESSIVE' if clear, or 'CONSERVATIVE' if cornering.
+    You are an AI race strategist. You control the car's physics engine dynamically.
+    Car Speed: {current_speed:.1f} km/h
+    Track Position: {track_position:.2f} (-1 left, 0 center, 1 right)
+    Front Radar: {distance_ahead:.1f}m clear ahead (-1 means a blind corner or wall).
+    
+    RULES:
+    1. If Front Radar > 100m: Set target_speed to 140, brake_threshold to 0.8, centering_gain to 0.2.
+    2. If Front Radar < 80m OR equals -1: A sharp corner is here! Set target_speed to 50, brake_threshold to 0.4, centering_gain to 0.8.
+    
+    You MUST output ONLY a valid JSON object. Do not include any other text.
+    Example format:
+    {{"target_speed": 100, "brake_threshold": 0.5, "centering_gain": 0.5}}
     """
     
     try:
         output = replicate.run(
             "ibm-granite/granite-3.1-8b-instruct", 
-            input={"prompt": prompt, "max_tokens": 10}
+            input={"prompt": prompt, "max_tokens": 50}
         )
-        response_text = "".join(output).strip().upper()
+        response_text = "".join(output).strip()
         
-        if "AGGRESSIVE" in response_text:
-            CURRENT_STRATEGY = "AGGRESSIVE"
-            print(f"\n[PIT-WALL] Radar shows {distance_ahead:.0f}m clear. Radio: PUSH HARD\n")
-        elif "CONSERVATIVE" in response_text:
-            CURRENT_STRATEGY = "CONSERVATIVE"
-            print(f"\n[PIT-WALL] Radar shows {distance_ahead:.0f}m clear. Radio: PLAY IT SAFE\n")
+        # Extract JSON using regex in case Granite adds conversational text
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            data = json.loads(json_str)
+            
+            # Safely update the global physics variables
+            CURRENT_STRATEGY_PARAMS["TARGET_SPEED"] = float(data.get("target_speed", 80))
+            CURRENT_STRATEGY_PARAMS["BRAKE_THRESHOLD"] = float(data.get("brake_threshold", 0.5))
+            CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"] = float(data.get("centering_gain", 0.5))
+            
+            print(f"\n[PIT-WALL] Radar: {distance_ahead:.0f}m | JSON Applied: Speed {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}, Steer {CURRENT_STRATEGY_PARAMS['CENTERING_GAIN']}\n")
+        else:
+            print(f"\n[PIT-WALL] Failed to parse JSON from AI: {response_text}\n")
             
     except Exception as e:
         pass 
@@ -508,25 +527,21 @@ def traction_control(S, accel):
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
-    global TARGET_SPEED, BRAKE_THRESHOLD, CENTERING_GAIN, CURRENT_STRATEGY
+    global TARGET_SPEED, BRAKE_THRESHOLD, CENTERING_GAIN
     
     S, R = c.S.d, c.R.d
     
-    # COMMIT 1: Extract the 19-point track radar and 36-point opponent radar
     track_radar = S.get('track', [200] * 19)
     opponent_radar = S.get('opponents', [200] * 36)
     
     ask_pit_wall_async(S.get('speedX', 0), S.get('trackPos', 0), track_radar, opponent_radar)
     
-    if CURRENT_STRATEGY == "AGGRESSIVE":
-        TARGET_SPEED = 140  
-        BRAKE_THRESHOLD = 0.8
-        CENTERING_GAIN = 0.20
-    elif CURRENT_STRATEGY == "CONSERVATIVE":
-        TARGET_SPEED = 80
-        BRAKE_THRESHOLD = 0.4
-        CENTERING_GAIN = 0.60
+    # COMMIT 2: Dynamically apply the AI's JSON logic to the physics engine
+    TARGET_SPEED = CURRENT_STRATEGY_PARAMS["TARGET_SPEED"]
+    BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS["BRAKE_THRESHOLD"]
+    CENTERING_GAIN = CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"]
 
+    # 3. SMARTER EMERGENCY REFLEXES (Safety Net)
     if abs(S.get('trackPos', 0)) > 0.55 or abs(S.get('angle', 0)) > 0.4:
         TARGET_SPEED = 30       
         CENTERING_GAIN = 1.0    
@@ -534,18 +549,6 @@ def drive_modular(c):
             R['brake'] = 0.8
         else:
             R['brake'] = 0.0
-
-    R['steer'] = calculate_steering(S)
-    R['accel'] = calculate_throttle(S, R)
-    R['brake'] = apply_brakes(S)
-    R['accel'] = traction_control(S, R['accel'])
-    R['gear'] = shift_gears(S)
-    
-    if S.get('speedX', 0) < 5 and abs(S.get('trackPos', 0)) > 0.5:
-        R['brake'] = 0.0    
-        R['accel'] = 0.8    
-        
-    return
 
 # ================= MAIN LOOP =================
 if __name__ == "__main__":
