@@ -439,19 +439,22 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
     
     distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
     
+    # Ensure -1 (glitch/wall) is treated as 0 meters clear
+    safe_distance = 0 if distance_ahead == -1 else distance_ahead
+
     prompt = f"""
-    You are an AI race strategist. You control the car's physics engine dynamically.
-    Car Speed: {current_speed:.1f} km/h
-    Track Position: {track_position:.2f} (-1 left, 0 center, 1 right)
-    Front Radar: {distance_ahead:.1f}m clear ahead (-1 means a blind corner or wall).
-    
-    RULES:
-    1. If Front Radar > 100m: Set target_speed to 140, brake_threshold to 0.8, centering_gain to 0.2.
-    2. If Front Radar < 80m OR equals -1: A sharp corner is here! Set target_speed to 50, brake_threshold to 0.4, centering_gain to 0.8.
-    
-    You MUST output ONLY a valid JSON object. Do not include any other text.
-    Example format:
-    {{"target_speed": 100, "brake_threshold": 0.5, "centering_gain": 0.5}}
+    You are an AI race strategist controlling a car's physics engine.
+    Current Speed: {current_speed:.1f} km/h
+    Track Position: {track_position:.2f} (-1 left, 1 right, 0 center)
+    Clear Track Ahead: {safe_distance:.1f}m
+
+    CALCULATION RULES:
+    1. target_speed: Calculate as (Clear Track Ahead * 0.8). Cap the maximum at 150. If Clear Track < 40m, set to 30.
+    2. brake_threshold: If Clear Track < 60m, set to 0.3 (heavy braking). Otherwise 0.8.
+    3. centering_gain: If Clear Track < 60m, set to 1.0 (tight turning). Otherwise 0.2.
+
+    Do not explain your reasoning. Output ONLY a valid JSON object with the calculated values:
+    {{"target_speed": [value], "brake_threshold": [value], "centering_gain": [value]}}
     """
     
     try:
@@ -531,12 +534,12 @@ def drive_modular(c):
     
     S, R = c.S.d, c.R.d
     
+    # 1. READ RADAR & PING CLOUD
     track_radar = S.get('track', [200] * 19)
     opponent_radar = S.get('opponents', [200] * 36)
-    
     ask_pit_wall_async(S.get('speedX', 0), S.get('trackPos', 0), track_radar, opponent_radar)
     
-    # COMMIT 2: Dynamically apply the AI's JSON logic to the physics engine
+    # 2. COMMIT 2: APPLY AI'S JSON LOGIC
     TARGET_SPEED = CURRENT_STRATEGY_PARAMS["TARGET_SPEED"]
     BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS["BRAKE_THRESHOLD"]
     CENTERING_GAIN = CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"]
@@ -549,6 +552,24 @@ def drive_modular(c):
             R['brake'] = 0.8
         else:
             R['brake'] = 0.0
+
+    # 4. DRIVE THE CAR (Apply physics calculations)
+    R['steer'] = calculate_steering(S)
+    R['accel'] = calculate_throttle(S, R)
+    R['brake'] = apply_brakes(S)
+    R['accel'] = traction_control(S, R['accel'])
+    R['gear'] = shift_gears(S)
+    
+    # 5. COMMIT 3: ANTI-PARALYSIS OVERRIDE (The Reverse Protocol)
+    # If we are barely moving and stuck near the wall...
+    if S.get('speedX', 0) < 5 and abs(S.get('trackPos', 0)) > 0.5:
+        R['gear'] = -1           # Shift into Reverse!
+        R['accel'] = 0.8         # Hit the gas
+        R['brake'] = 0.0         # Off the brakes
+        # Turn the wheels opposite to the wall to back out
+        R['steer'] = -math.copysign(1.0, S.get('trackPos', 0)) 
+        
+    return
 
 # ================= MAIN LOOP =================
 if __name__ == "__main__":
