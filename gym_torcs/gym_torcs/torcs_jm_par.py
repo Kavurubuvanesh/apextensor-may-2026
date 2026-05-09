@@ -428,16 +428,16 @@ RADIO_IS_BUSY = False
 IS_FIRST_BOOT = True  
 
 # STATE MACHINE FOR RECOVERY
-RECOVERY_STATE = 0  # 0 = Normal, 100->50 = Reverse, 50->0 = Forward Escape
+RECOVERY_STATE = 0  
 
 CURRENT_STRATEGY_PARAMS = {
-    "TARGET_SPEED": 80,
+    "TARGET_SPEED": 80.0,
     "BRAKE_THRESHOLD": 0.5,
     "CENTERING_GAIN": 0.5,
     "TARGET_LANE": 0.0
 }
 
-# UPGRADE: Rate-Limit Proofing & 140 km/h Cap
+# CLOUD STRATEGY ENGINE
 def fetch_strategy_from_cloud(current_speed, track_position, track_radar, opponent_radar):
     global CURRENT_STRATEGY_PARAMS, RADIO_IS_BUSY, IS_FIRST_BOOT
     
@@ -452,7 +452,7 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
         center_opp = left_opp = right_opp = 200
 
     if IS_FIRST_BOOT:
-        print("\n[PIT-WALL] Transmitting initial telemetry... Waking up Granite AI cloud container (This cold-start may take 15-20 seconds)...\n")
+        print("\n[PIT-WALL] Transmitting telemetry... Waking up IBM Granite AI (Cold-start ~15s)... Pace Car Active.\n")
 
     prompt = f"""
     You are an advanced autonomous racing AI.
@@ -461,7 +461,7 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
     Opponents - Left: {left_opp:.1f}m | Center: {center_opp:.1f}m | Right: {right_opp:.1f}m
 
     STRATEGY RULES:
-    1. target_speed: If Clear Track > 120m AND Center Opponent > 80m, output 140 (Max Safe Speed). If an opponent is blocking the center (< 50m), reduce speed to 90. If Clear Track < 60m, output 40.
+    1. target_speed: If Clear Track > 120m AND Center Opponent > 80m, output 140. If an opponent is blocking the center (< 50m), reduce speed to 90. If Clear Track < 60m, output 40.
     2. target_lane: If Center Opponent < 60m, output 0.5 (shift right) if Right space > Left space, or -0.5 (shift left) if Left space > Right space. Otherwise, output 0.0.
     3. brake_threshold & centering_gain: 0.9 and 0.15 for straights. 0.3 and 0.9 for sharp turns.
 
@@ -487,7 +487,7 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
             CURRENT_STRATEGY_PARAMS["TARGET_LANE"] = float(data.get("target_lane", 0.0))
             
             IS_FIRST_BOOT = False 
-            print(f"\n[PIT-WALL] Clear: {safe_distance:.0f}m | Center Opp: {center_opp:.0f}m | Shift: {CURRENT_STRATEGY_PARAMS['TARGET_LANE']} | Speed: {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}\n")
+            print(f"\n[PIT-WALL] Clear: {safe_distance:.0f}m | Center Opp: {center_opp:.0f}m | Shift: {CURRENT_STRATEGY_PARAMS['TARGET_LANE']} | Speed Limit Requested: {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}\n")
         else:
             print(f"\n[PIT-WALL] Invalid Payload Format Received\n")
             
@@ -500,7 +500,6 @@ def ask_pit_wall_async(current_speed, track_position, track_radar, opponent_rada
     global LAST_AI_CALL, RADIO_IS_BUSY
     current_time = time.time()
     
-    # EXACTLY 12.5 SECONDS to prevent Replicate 429 Rate Limits (max 6/min)
     if current_time - LAST_AI_CALL < 12.5 or RADIO_IS_BUSY:
         return 
         
@@ -548,56 +547,78 @@ def drive_modular(c):
     S, R = c.S.d, c.R.d
     current_speed = S.get('speedX', 0)
     
-    # 1. TWO-PHASE RECOVERY MACHINE (Fixes Infinite Reverse Loop)
+    # ---------------------------------------------------------
+    # SYSTEM 1: 3-PHASE KINEMATIC RECOVERY MACHINE
+    # ---------------------------------------------------------
     if RECOVERY_STATE > 0:
-        if RECOVERY_STATE > 50:
-            # PHASE 1: Back up straight (frames 100 to 51)
-            R['gear'] = -1           
-            R['accel'] = 1.0         
-            R['brake'] = 0.0         
-            R['steer'] = 0.0         # DO NOT TURN WHEEL IN REVERSE
+        if RECOVERY_STATE > 80:
+            # PHASE 1: Full Stop (Kill all sliding momentum, frames 100-81)
+            R['gear'] = 1; R['brake'] = 1.0; R['accel'] = 0.0; R['steer'] = 0.0
+        elif RECOVERY_STATE > 40:
+            # PHASE 2: Inverted Reverse (Pull nose away from wall, frames 80-41)
+            R['gear'] = -1; R['brake'] = 0.0; R['accel'] = 0.8
+            # In reverse, steering toward the wall pushes the nose away from it
+            R['steer'] = math.copysign(1.0, S.get('trackPos', 0)) 
         else:
-            # PHASE 2: Forced Forward Escape (frames 50 to 1)
-            R['gear'] = 1
-            R['accel'] = 1.0
-            R['brake'] = 0.0
-            R['steer'] = -math.copysign(0.5, S.get('trackPos', 0)) # Steer gently toward center
+            # PHASE 3: Forward Escape (Re-align to track, frames 40-1)
+            R['gear'] = 1; R['brake'] = 0.0; R['accel'] = 0.8
+            R['steer'] = -math.copysign(1.0, S.get('trackPos', 0)) 
             
         RECOVERY_STATE -= 1
-        return  # Skip all normal AI physics while recovering
+        return  # Bypass all other AI logic while surviving
     
-    # 2. READ RADAR & PING CLOUD
+    # ---------------------------------------------------------
+    # SYSTEM 2: TELEMETRY & PACE CAR PROTOCOL
+    # ---------------------------------------------------------
     track_radar = S.get('track', [200] * 19)
     opponent_radar = S.get('opponents', [200] * 36)
     ask_pit_wall_async(current_speed, S.get('trackPos', 0), track_radar, opponent_radar)
     
-    # 3. APPLY AI'S JSON LOGIC
-    TARGET_SPEED = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80)
-    BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS.get("BRAKE_THRESHOLD", 0.5)
-    CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
-    TARGET_LANE = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
+    if IS_FIRST_BOOT:
+        # PACE CAR MODE: Safe crawling while cloud AI boots up
+        TARGET_SPEED = 40.0
+        BRAKE_THRESHOLD = 0.5
+        CENTERING_GAIN = 1.0
+        TARGET_LANE = 0.0
+    else:
+        # SYSTEM 3: THE HARDWARE GOVERNOR (Never trust the AI completely)
+        ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80)
+        TARGET_SPEED = min(120.0, ai_speed)  # Hard physical cap at 120 km/h
+        BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS.get("BRAKE_THRESHOLD", 0.5)
+        CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
+        TARGET_LANE = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
 
-    # 4. VELOCITY-SCALED EMERGENCY REFLEXES
+    # ---------------------------------------------------------
+    # SYSTEM 4: VELOCITY-SCALED EMERGENCY BRAKING
+    # ---------------------------------------------------------
     distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
-    dynamic_brake_zone = max(35, current_speed * 0.6) # Dynamic braking math
+    
+    # Braking physics: Require 0.9 meters of braking room per km/h
+    dynamic_brake_zone = max(50.0, current_speed * 0.9) 
 
-    if distance_ahead < dynamic_brake_zone or abs(S.get('trackPos', 0)) > 0.85 or abs(S.get('angle', 0)) > 0.5:
-        TARGET_SPEED = 35       
+    if distance_ahead < dynamic_brake_zone or abs(S.get('trackPos', 0)) > 0.80:
+        TARGET_SPEED = 30.0       
         CENTERING_GAIN = 1.0    
-        if current_speed > 20:
-            R['brake'] = 0.9 
+        if current_speed > 25:
+            R['brake'] = 1.0  # Maximum hydraulic pressure
         else:
             R['brake'] = 0.0
 
-    # 5. DRIVE THE CAR 
+    # ---------------------------------------------------------
+    # SYSTEM 5: STANDARD KINEMATICS
+    # ---------------------------------------------------------
     R['steer'] = calculate_steering(S)
     R['accel'] = calculate_throttle(S, R)
-    R['brake'] = apply_brakes(S)
+    
+    # Apply brakes from standard logic, but don't override emergency braking
+    normal_brake = apply_brakes(S)
+    if R['brake'] < normal_brake:
+        R['brake'] = normal_brake
+        
     R['accel'] = traction_control(S, R['accel'])
     R['gear'] = shift_gears(S)
     
-    # 6. TRIGGER RECOVERY MODE
-    # Only trigger if practically stopped and off the track
+    # TRIGGER 3-PHASE RECOVERY IF PARALYZED
     if current_speed < 3 and abs(S.get('trackPos', 0)) > 0.7:
         RECOVERY_STATE = 100  # Start the 100-frame (2-second) escape sequence
         
