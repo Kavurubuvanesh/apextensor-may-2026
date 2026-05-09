@@ -430,53 +430,59 @@ RADIO_IS_BUSY = False
 CURRENT_STRATEGY_PARAMS = {
     "TARGET_SPEED": 80,
     "BRAKE_THRESHOLD": 0.5,
-    "CENTERING_GAIN": 0.5
+    "CENTERING_GAIN": 0.5,
+    "TARGET_LANE": 0.0  # NEW: 0.0 is center, -0.5 is left, 0.5 is right
 }
 
-# COMMIT 2: JSON Reasoning Pipeline
+# COMMIT 4: UPGRADE 1 - The Overtake Protocol
 def fetch_strategy_from_cloud(current_speed, track_position, track_radar, opponent_radar):
     global CURRENT_STRATEGY_PARAMS, RADIO_IS_BUSY
     
     distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
-    
-    # Ensure -1 (glitch/wall) is treated as 0 meters clear
     safe_distance = 0 if distance_ahead == -1 else distance_ahead
+    
+    # Slice the 36-point opponent radar into Spatial Zones
+    # In TORCS, index 0 is forward, positive indices go left, negative/high indices go right.
+    if len(opponent_radar) >= 36:
+        center_opp = min(opponent_radar[0], opponent_radar[1], opponent_radar[35])
+        left_opp = min(opponent_radar[2:6])
+        right_opp = min(opponent_radar[30:34])
+    else:
+        center_opp = left_opp = right_opp = 200
 
     prompt = f"""
-    You are an AI race strategist controlling a car's physics engine.
-    Current Speed: {current_speed:.1f} km/h
-    Track Position: {track_position:.2f} (-1 left, 1 right, 0 center)
+    You are an advanced autonomous racing AI.
+    Speed: {current_speed:.1f} km/h | Track Position: {track_position:.2f} (-1 left, 1 right, 0 center)
     Clear Track Ahead: {safe_distance:.1f}m
+    Opponents - Left: {left_opp:.1f}m | Center: {center_opp:.1f}m | Right: {right_opp:.1f}m
 
     STRATEGY RULES:
-    1. If Clear Track > 120m (Straightaway): Output exactly {{"target_speed": 180, "brake_threshold": 0.9, "centering_gain": 0.15}}
-    2. If Clear Track between 60m and 120m (Approaching Corner): Output exactly {{"target_speed": 90, "brake_threshold": 0.6, "centering_gain": 0.5}}
-    3. If Clear Track < 60m (Sharp Turn): Output exactly {{"target_speed": 40, "brake_threshold": 0.3, "centering_gain": 0.9}}
+    1. target_speed: If Clear Track > 120m AND Center Opponent > 80m, output 180. If an opponent is blocking the center (< 50m), reduce speed to 100 to prepare for maneuver. If Clear Track < 60m, output 40.
+    2. target_lane: If Center Opponent < 60m, you MUST evade! Output 0.5 (shift right) if Right space > Left space. Output -0.5 (shift left) if Left space > Right space. Otherwise, output 0.0 (hold center).
+    3. brake_threshold & centering_gain: 0.9 and 0.15 for straights. 0.3 and 0.9 for sharp turns or evasive maneuvers.
 
-    Output ONLY a valid JSON object. Do not explain.
+    Output ONLY a valid JSON object matching this exact format:
+    {{"target_speed": 180.0, "brake_threshold": 0.9, "centering_gain": 0.15, "target_lane": 0.0}}
     """
     
     try:
         output = replicate.run(
             "ibm-granite/granite-3.1-8b-instruct", 
-            input={"prompt": prompt, "max_tokens": 50}
+            input={"prompt": prompt, "max_tokens": 60}
         )
         response_text = "".join(output).strip()
         
-        # Extract JSON using regex in case Granite adds conversational text
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if match:
             json_str = match.group(0)
             data = json.loads(json_str)
             
-            # Safely update the global physics variables
             CURRENT_STRATEGY_PARAMS["TARGET_SPEED"] = float(data.get("target_speed", 80))
             CURRENT_STRATEGY_PARAMS["BRAKE_THRESHOLD"] = float(data.get("brake_threshold", 0.5))
             CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"] = float(data.get("centering_gain", 0.5))
+            CURRENT_STRATEGY_PARAMS["TARGET_LANE"] = float(data.get("target_lane", 0.0))
             
-            print(f"\n[PIT-WALL] Radar: {distance_ahead:.0f}m | JSON Applied: Speed {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}, Steer {CURRENT_STRATEGY_PARAMS['CENTERING_GAIN']}\n")
-        else:
-            print(f"\n[PIT-WALL] Failed to parse JSON from AI: {response_text}\n")
+            print(f"\n[PIT-WALL] Center Opp: {center_opp:.0f}m | Shift Lane: {CURRENT_STRATEGY_PARAMS['TARGET_LANE']} | Speed: {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}\n")
             
     except Exception as e:
         pass 
@@ -499,7 +505,10 @@ def ask_pit_wall_async(current_speed, track_position, track_radar, opponent_rada
 
 # ================= HELPER FUNCTIONS =================
 def calculate_steering(S):
-    steer = (S.get('angle', 0) * STEER_GAIN / math.pi) - (S.get('trackPos', 0) * CENTERING_GAIN)
+    # Professional PID-style lane tracking. 
+    # We calculate the delta between where we are and the AI's commanded lane.
+    lane_error = S.get('trackPos', 0) - TARGET_LANE
+    steer = (S.get('angle', 0) * 0.5 / math.pi) - (lane_error * CENTERING_GAIN)
     return max(-1, min(1, steer))
 
 def calculate_throttle(S, R):
@@ -542,6 +551,7 @@ def drive_modular(c):
     TARGET_SPEED = CURRENT_STRATEGY_PARAMS["TARGET_SPEED"]
     BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS["BRAKE_THRESHOLD"]
     CENTERING_GAIN = CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"]
+    TARGET_LANE = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0) # NEW
 
     # 3. SMARTER EMERGENCY REFLEXES (Hybrid Safety Net)
     # The local loop now checks the radar 50 times a second to survive the 11s AI cooldown.
