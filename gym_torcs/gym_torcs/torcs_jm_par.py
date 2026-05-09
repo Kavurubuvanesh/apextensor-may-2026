@@ -469,7 +469,7 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
     try:
         output = replicate.run(
             "ibm-granite/granite-3.1-8b-instruct", 
-            input={"prompt": prompt, "max_tokens": 60}
+            input={"prompt": prompt, "max_tokens": 200} # INCREASED TO 200
         )
         response_text = "".join(output).strip()
         
@@ -509,6 +509,8 @@ def ask_pit_wall_async(current_speed, track_position, track_radar, opponent_rada
     thread.start()
 
 # ================= HELPER FUNCTIONS =================
+TARGET_LANE = 0.0
+REVERSE_TIMER = 0  # NEW: Tracks how long we stay in reverse
 def calculate_steering(S):
     # Professional PID-style lane tracking. 
     # We calculate the delta between where we are and the AI's commanded lane.
@@ -543,49 +545,58 @@ def traction_control(S, accel):
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
-    global TARGET_SPEED, BRAKE_THRESHOLD, CENTERING_GAIN
+    global TARGET_SPEED, BRAKE_THRESHOLD, CENTERING_GAIN, TARGET_LANE, REVERSE_TIMER
     
     S, R = c.S.d, c.R.d
+    current_speed = S.get('speedX', 0)
     
     # 1. READ RADAR & PING CLOUD
     track_radar = S.get('track', [200] * 19)
     opponent_radar = S.get('opponents', [200] * 36)
-    ask_pit_wall_async(S.get('speedX', 0), S.get('trackPos', 0), track_radar, opponent_radar)
+    ask_pit_wall_async(current_speed, S.get('trackPos', 0), track_radar, opponent_radar)
     
-    # 2. COMMIT 2: APPLY AI'S JSON LOGIC
-    TARGET_SPEED = CURRENT_STRATEGY_PARAMS["TARGET_SPEED"]
-    BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS["BRAKE_THRESHOLD"]
-    CENTERING_GAIN = CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"]
-    TARGET_LANE = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0) # NEW
+    # 2. STATEFUL RECOVERY PROTOCOL (Fixes the infinite backward driving)
+    if REVERSE_TIMER > 0:
+        R['gear'] = -1           # Force Reverse
+        R['accel'] = 0.8         # Hit the gas
+        R['brake'] = 0.0         # Off the brakes
+        # Steer away from the wall
+        R['steer'] = -math.copysign(1.0, S.get('trackPos', 0)) 
+        REVERSE_TIMER -= 1       # Tick down the timer
+        return                   # Skip all other physics while recovering!
 
-    # 3. SMARTER EMERGENCY REFLEXES (Hybrid Safety Net)
-    # The local loop now checks the radar 50 times a second to survive the 11s AI cooldown.
+    # 3. APPLY AI'S JSON LOGIC
+    TARGET_SPEED = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80)
+    BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS.get("BRAKE_THRESHOLD", 0.5)
+    CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
+    TARGET_LANE = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
+
+    # 4. UPGRADE 4: VELOCITY-SCALED EMERGENCY REFLEXES
     distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
     
-    # Panic if a wall is suddenly < 45m away, OR if we are sliding off track (>0.75)
-    if distance_ahead < 45 or abs(S.get('trackPos', 0)) > 0.75 or abs(S.get('angle', 0)) > 0.5:
+    # Dynamic stopping distance: 0.7 meters per km/h 
+    # Example: At 180 km/h, it brakes at 126m. At 50 km/h, it brakes at 35m.
+    dynamic_brake_zone = max(40, current_speed * 0.7)
+
+    if distance_ahead < dynamic_brake_zone or abs(S.get('trackPos', 0)) > 0.80 or abs(S.get('angle', 0)) > 0.5:
         TARGET_SPEED = 35       
         CENTERING_GAIN = 1.0    
-        if S.get('speedX', 0) > 25:
+        if current_speed > 20:
             R['brake'] = 0.9  # SLAM BRAKES
         else:
             R['brake'] = 0.0
 
-    # 4. DRIVE THE CAR (Apply physics calculations)
+    # 5. DRIVE THE CAR (Apply physics calculations)
     R['steer'] = calculate_steering(S)
     R['accel'] = calculate_throttle(S, R)
     R['brake'] = apply_brakes(S)
     R['accel'] = traction_control(S, R['accel'])
     R['gear'] = shift_gears(S)
     
-    # 5. COMMIT 3: ANTI-PARALYSIS OVERRIDE (The Reverse Protocol)
-    # If we are barely moving and stuck near the wall...
-    if S.get('speedX', 0) < 5 and abs(S.get('trackPos', 0)) > 0.5:
-        R['gear'] = -1           # Shift into Reverse!
-        R['accel'] = 0.8         # Hit the gas
-        R['brake'] = 0.0         # Off the brakes
-        # Turn the wheels opposite to the wall to back out
-        R['steer'] = -math.copysign(1.0, S.get('trackPos', 0)) 
+    # 6. TRIGGER RECOVERY MODE
+    # If we are stuck (speed < 5 and off-center), initiate the timer
+    if current_speed < 5 and abs(S.get('trackPos', 0)) > 0.6:
+        REVERSE_TIMER = 75  # Run the reverse state for 75 frames (1.5 seconds)
         
     return
 
