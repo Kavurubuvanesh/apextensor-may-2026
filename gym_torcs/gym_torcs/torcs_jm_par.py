@@ -448,13 +448,12 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
     Track Position: {track_position:.2f} (-1 left, 1 right, 0 center)
     Clear Track Ahead: {safe_distance:.1f}m
 
-    CALCULATION RULES:
-    1. target_speed: Calculate as (Clear Track Ahead * 0.8). Cap the maximum at 150. If Clear Track < 40m, set to 30.
-    2. brake_threshold: If Clear Track < 60m, set to 0.3 (heavy braking). Otherwise 0.8.
-    3. centering_gain: If Clear Track < 60m, set to 1.0 (tight turning). Otherwise 0.2.
+    STRATEGY RULES:
+    1. If Clear Track > 120m (Straightaway): Output exactly {{"target_speed": 180, "brake_threshold": 0.9, "centering_gain": 0.15}}
+    2. If Clear Track between 60m and 120m (Approaching Corner): Output exactly {{"target_speed": 90, "brake_threshold": 0.6, "centering_gain": 0.5}}
+    3. If Clear Track < 60m (Sharp Turn): Output exactly {{"target_speed": 40, "brake_threshold": 0.3, "centering_gain": 0.9}}
 
-    Do not explain your reasoning. Output ONLY a valid JSON object with the calculated values:
-    {{"target_speed": [value], "brake_threshold": [value], "centering_gain": [value]}}
+    Output ONLY a valid JSON object. Do not explain.
     """
     
     try:
@@ -544,12 +543,16 @@ def drive_modular(c):
     BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS["BRAKE_THRESHOLD"]
     CENTERING_GAIN = CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"]
 
-    # 3. SMARTER EMERGENCY REFLEXES (Safety Net)
-    if abs(S.get('trackPos', 0)) > 0.55 or abs(S.get('angle', 0)) > 0.4:
-        TARGET_SPEED = 30       
+    # 3. SMARTER EMERGENCY REFLEXES (Hybrid Safety Net)
+    # The local loop now checks the radar 50 times a second to survive the 11s AI cooldown.
+    distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
+    
+    # Panic if a wall is suddenly < 45m away, OR if we are sliding off track (>0.75)
+    if distance_ahead < 45 or abs(S.get('trackPos', 0)) > 0.75 or abs(S.get('angle', 0)) > 0.5:
+        TARGET_SPEED = 35       
         CENTERING_GAIN = 1.0    
-        if S.get('speedX', 0) > 20:
-            R['brake'] = 0.8
+        if S.get('speedX', 0) > 25:
+            R['brake'] = 0.9  # SLAM BRAKES
         else:
             R['brake'] = 0.0
 
