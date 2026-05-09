@@ -425,30 +425,31 @@ ENABLE_TRACTION_CONTROL = True
 # --- PIT-WALL AI STRATEGIST (MULTI-THREADED JSON BRAIN) ---
 LAST_AI_CALL = 0  
 RADIO_IS_BUSY = False  
+IS_FIRST_BOOT = True  # NEW: Tracks if the cloud GPU needs to warm up
 
-# The dynamic parameters the AI will now control
 CURRENT_STRATEGY_PARAMS = {
     "TARGET_SPEED": 80,
     "BRAKE_THRESHOLD": 0.5,
     "CENTERING_GAIN": 0.5,
-    "TARGET_LANE": 0.0  # NEW: 0.0 is center, -0.5 is left, 0.5 is right
+    "TARGET_LANE": 0.0
 }
 
-# COMMIT 4: UPGRADE 1 - The Overtake Protocol
+# COMMIT 5: Production Diagnostics & Cold-Start Handling
 def fetch_strategy_from_cloud(current_speed, track_position, track_radar, opponent_radar):
-    global CURRENT_STRATEGY_PARAMS, RADIO_IS_BUSY
+    global CURRENT_STRATEGY_PARAMS, RADIO_IS_BUSY, IS_FIRST_BOOT
     
     distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
     safe_distance = 0 if distance_ahead == -1 else distance_ahead
     
-    # Slice the 36-point opponent radar into Spatial Zones
-    # In TORCS, index 0 is forward, positive indices go left, negative/high indices go right.
     if len(opponent_radar) >= 36:
         center_opp = min(opponent_radar[0], opponent_radar[1], opponent_radar[35])
         left_opp = min(opponent_radar[2:6])
         right_opp = min(opponent_radar[30:34])
     else:
         center_opp = left_opp = right_opp = 200
+
+    if IS_FIRST_BOOT:
+        print("\n[PIT-WALL] Transmitting initial telemetry... Waking up Granite AI cloud container (This cold-start may take 15-20 seconds)...\n")
 
     prompt = f"""
     You are an advanced autonomous racing AI.
@@ -482,10 +483,14 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
             CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"] = float(data.get("centering_gain", 0.5))
             CURRENT_STRATEGY_PARAMS["TARGET_LANE"] = float(data.get("target_lane", 0.0))
             
+            IS_FIRST_BOOT = False # Container is officially warm
             print(f"\n[PIT-WALL] Center Opp: {center_opp:.0f}m | Shift Lane: {CURRENT_STRATEGY_PARAMS['TARGET_LANE']} | Speed: {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}\n")
+        else:
+            print(f"\n[PIT-WALL] Invalid Payload Format Received: {response_text}\n")
             
     except Exception as e:
-        pass 
+        # NO MORE SILENT FAILURES. We log exactly why the cloud failed.
+        print(f"\n[PIT-WALL] RADIO INTERFERENCE (API Error): {e}\n")
     finally:
         RADIO_IS_BUSY = False
 
