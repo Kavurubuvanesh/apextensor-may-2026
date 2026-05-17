@@ -430,6 +430,9 @@ LAST_AI_CALL = 0
 RADIO_IS_BUSY = False  
 IS_FIRST_BOOT = True  
 
+# NEW: THE TEMPORAL CONTEXT BUFFER
+TELEMETRY_HISTORY = []  # Stores the last 3 AI decisions to calculate momentum  
+
 # STATE MACHINE FOR RECOVERY
 RECOVERY_STATE = 0  
 
@@ -442,7 +445,7 @@ CURRENT_STRATEGY_PARAMS = {
 
 # CLOUD STRATEGY ENGINE
 def fetch_strategy_from_cloud(current_speed, track_position, track_radar, opponent_radar):
-    global CURRENT_STRATEGY_PARAMS, RADIO_IS_BUSY, IS_FIRST_BOOT
+    global CURRENT_STRATEGY_PARAMS, RADIO_IS_BUSY, IS_FIRST_BOOT, TELEMETRY_HISTORY
     
     distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
     safe_distance = 0 if distance_ahead == -1 else distance_ahead
@@ -457,17 +460,30 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
     if IS_FIRST_BOOT:
         print("\n[PIT-WALL] Cloud AI is booting (Takes 60-90s). Local Sub-Brain taking control of the race...\n")
 
-    # FIXED PROMPT: Removed hardcoded example numbers so the AI is forced to calculate.
+    # Format the Temporal Memory Buffer for the AI
+    history_text = "No history available (System Booting)."
+    if TELEMETRY_HISTORY:
+        history_text = ""
+        for idx, (h_spd, h_pos, h_cmd) in enumerate(TELEMETRY_HISTORY):
+            history_text += f"   - T-minus {(idx+1)*12.5}s: Speed {h_spd:.1f}, Pos {h_pos:.2f} | Commanded Speed: {h_cmd:.1f}\n"
+
+    # UPGRADED PROMPT: Now includes Time Context and Predictive Drift rules
     prompt = f"""
     You are an advanced autonomous racing AI.
+    
+    CURRENT STATE:
     Speed: {current_speed:.1f} km/h | Track Position: {track_position:.2f} (-1 left, 1 right, 0 center)
     Clear Track Ahead: {safe_distance:.1f}m
     Opponents - Left: {left_opp:.1f}m | Center: {center_opp:.1f}m | Right: {right_opp:.1f}m
+
+    TEMPORAL MEMORY (Past 3 Cycles):
+    {history_text}
 
     STRATEGY RULES:
     1. target_speed: If Clear Track > 120m AND Center Opponent > 80m, value is 140.0. If Center Opponent < 50m, value is 90.0. If Clear Track < 60m, value is 40.0.
     2. target_lane: If Center Opponent < 60m, value is 0.5 if Right space > Left space, or -0.5 if Left space > Right space. Otherwise, value is 0.0.
     3. brake_threshold & centering_gain: 0.9 and 0.15 for straights. 0.3 and 0.9 for sharp turns.
+    4. PREDICTIVE MOMENTUM: Look at the Temporal Memory. If your past positions show you drifting further away from 0.0 over time, you MUST increase centering_gain to 0.8 to stop the slide.
 
     Output ONLY a valid JSON object. Replace the brackets with your calculated numbers:
     {{"target_speed": [speed], "brake_threshold": [brake], "centering_gain": [gain], "target_lane": [lane]}}
@@ -490,8 +506,13 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
             CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"] = float(data.get("centering_gain", 0.5))
             CURRENT_STRATEGY_PARAMS["TARGET_LANE"] = float(data.get("target_lane", 0.0))
             
+            # UPGRADE 2: Update the Temporal Memory Buffer
+            TELEMETRY_HISTORY.insert(0, (current_speed, track_position, CURRENT_STRATEGY_PARAMS["TARGET_SPEED"]))
+            if len(TELEMETRY_HISTORY) > 3:  # Only keep the last 3 cycles (37.5 seconds of memory)
+                TELEMETRY_HISTORY.pop()
+            
             IS_FIRST_BOOT = False 
-            print(f"\n[PIT-WALL] Clear: {safe_distance:.0f}m | Center Opp: {center_opp:.0f}m | Shift: {CURRENT_STRATEGY_PARAMS['TARGET_LANE']} | AI Speed Commanded: {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}\n")
+            print(f"\n[PIT-WALL] Clear: {safe_distance:.0f}m | Pos: {track_position:.2f} | AI Speed Commanded: {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}\n")
         else:
             print(f"\n[PIT-WALL] Invalid Payload Format Received: {response_text}\n")
             
