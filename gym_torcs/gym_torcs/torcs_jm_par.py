@@ -421,6 +421,7 @@ CENTERING_GAIN = 0.40
 BRAKE_THRESHOLD = 0.5  
 GEAR_SPEEDS = [0, 20, 40, 80, 100, 180]  
 ENABLE_TRACTION_CONTROL = True
+TARGET_LANE = 0.0
 # --- PID CONTROL STATE ---
 STEERING_INTEGRAL = 0.0
 PREV_STEERING_ERROR = 0.0 
@@ -539,31 +540,28 @@ def ask_pit_wall_async(current_speed, track_position, track_radar, opponent_rada
 def calculate_steering(S):
     global TARGET_LANE, CENTERING_GAIN, STEERING_INTEGRAL, PREV_STEERING_ERROR
     
-    # 1. Calculate the Error Matrix (Position + Angle)
+    # 1. Spatial Error (Meters)
     lane_error = S.get('trackPos', 0) - TARGET_LANE
-    angle_error = S.get('angle', 0) / math.pi
-    
-    # Total error combines how far off-center we are, and which way the nose is pointing
-    current_error = lane_error + angle_error
     
     # 2. PID Constants
-    Kp = CENTERING_GAIN  # Proportional (Dynamically controlled by IBM Granite)
-    Ki = 0.005           # Integral (Corrects long-term drifting on sweeping curves)
-    Kd = 0.25            # Derivative (Dampens the wobble/oscillation at high speeds)
+    Kp = CENTERING_GAIN  
+    Ki = 0.005           
+    Kd = 0.3             
     
-    # 3. Integral Calculus (Accumulate past errors)
-    STEERING_INTEGRAL += current_error
-    # Anti-Windup Protocol: Prevent the integral from building up infinitely on hairpins
-    STEERING_INTEGRAL = max(-5.0, min(5.0, STEERING_INTEGRAL)) 
+    # 3. Integral Calculus (Accumulate past drifting)
+    STEERING_INTEGRAL += lane_error
+    STEERING_INTEGRAL = max(-2.0, min(2.0, STEERING_INTEGRAL)) # Anti-windup
     
-    # 4. Derivative Calculus (Predict future error rate)
-    derivative = current_error - PREV_STEERING_ERROR
+    # 4. Derivative Calculus (Predict future position)
+    derivative = lane_error - PREV_STEERING_ERROR
     
-    # 5. The Ultimate Steering Equation
-    steer = -(Kp * current_error) - (Ki * STEERING_INTEGRAL) - (Kd * derivative)
+    # 5. The Ultimate Steering Equation (Align nose, then apply PID correction)
+    base_alignment = S.get('angle', 0) * 0.5 / math.pi
+    pid_correction = (Kp * lane_error) + (Ki * STEERING_INTEGRAL) + (Kd * derivative)
     
-    # Save current state for the next 50Hz frame
-    PREV_STEERING_ERROR = current_error
+    steer = base_alignment - pid_correction
+    
+    PREV_STEERING_ERROR = lane_error
     
     return max(-1.0, min(1.0, steer))
 
@@ -585,11 +583,33 @@ def shift_gears(S):
             gear = i + 1
     return min(gear, 6)
 
-def traction_control(S, accel):
-    if len(S.get('wheelSpinVel', [])) >= 4:
-        if ((S['wheelSpinVel'][2] + S['wheelSpinVel'][3]) - (S['wheelSpinVel'][0] + S['wheelSpinVel'][1])) > 2:
-            accel -= 0.1
-    return max(0.0, accel)
+def traction_control(S, accel, steer):
+    # UPGRADE 3: Dynamic Slip-Angle Physics (The Friction Circle)
+    wheel_speeds = S.get('wheelSpinVel', [0, 0, 0, 0])
+    
+    if len(wheel_speeds) < 4:
+        return accel
+
+    # Calculate the exact delta between driven wheels (rear) and rolling wheels (front)
+    front_speed = (wheel_speeds[0] + wheel_speeds[1]) / 2.0
+    rear_speed = (wheel_speeds[2] + wheel_speeds[3]) / 2.0
+    slip_delta = rear_speed - front_speed
+
+    # 1. The Friction Circle calculation: The harder we steer, the less throttle we can use
+    steering_load = abs(steer)
+    
+    # Base allowed slip is 2.5 rad/s (straight line). As we steer, allowed slip drops to 0.5 rad/s
+    max_allowed_slip = 2.5 - (steering_load * 2.0)
+    max_allowed_slip = max(0.5, max_allowed_slip) 
+
+    # 2. Algorithmic Throttle Feathering
+    if slip_delta > max_allowed_slip:
+        # We are breaking traction! Attenuate the throttle aggressively
+        slip_severity = slip_delta - max_allowed_slip
+        # The worse the slip, the more we cut the gas
+        accel = accel - (slip_severity * 0.2) 
+        
+    return max(0.0, min(1.0, accel))
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
@@ -658,7 +678,8 @@ def drive_modular(c):
     if R['brake'] < normal_brake:
         R['brake'] = normal_brake
         
-    R['accel'] = traction_control(S, R['accel'])
+    # NEW: Pass the steering angle into the physics engine
+    R['accel'] = traction_control(S, R['accel'], R['steer'])
     R['gear'] = shift_gears(S)
     
     # TRIGGER 3-PHASE RECOVERY
