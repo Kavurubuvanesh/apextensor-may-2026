@@ -661,11 +661,14 @@ def drive_modular(c):
     # ---------------------------------------------------------
     dynamic_brake_zone = max(45.0, current_speed * 0.8) 
 
+    # THE CRITICAL FIX: Reset the brake pedal at the start of every physics frame
+    R['brake'] = 0.0 
+
     if distance_ahead < dynamic_brake_zone or abs(S.get('trackPos', 0)) > 0.80:
         TARGET_SPEED = 30.0       
         CENTERING_GAIN = 1.0    
         if current_speed > 25:
-            R['brake'] = 1.0  
+            R['brake'] = 1.0  # Maximum hydraulic pressure
         else:
             R['brake'] = 0.0
 
@@ -674,11 +677,12 @@ def drive_modular(c):
     # ---------------------------------------------------------
     R['steer'] = calculate_steering(S)
     R['accel'] = calculate_throttle(S, R)
+    
+    # Apply normal turning brakes, but only if they are stronger than emergency brakes
     normal_brake = apply_brakes(S)
     if R['brake'] < normal_brake:
         R['brake'] = normal_brake
         
-    # NEW: Pass the steering angle into the physics engine
     R['accel'] = traction_control(S, R['accel'], R['steer'])
     R['gear'] = shift_gears(S)
     
