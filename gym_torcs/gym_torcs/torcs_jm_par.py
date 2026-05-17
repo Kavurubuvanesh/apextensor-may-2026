@@ -420,7 +420,10 @@ STEER_GAIN = 40
 CENTERING_GAIN = 0.40  
 BRAKE_THRESHOLD = 0.5  
 GEAR_SPEEDS = [0, 20, 40, 80, 100, 180]  
-ENABLE_TRACTION_CONTROL = True  
+ENABLE_TRACTION_CONTROL = True
+# --- PID CONTROL STATE ---
+STEERING_INTEGRAL = 0.0
+PREV_STEERING_ERROR = 0.0 
 
 # --- PIT-WALL AI STRATEGIST (MULTI-THREADED JSON BRAIN) ---
 LAST_AI_CALL = 0  
@@ -452,8 +455,9 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
         center_opp = left_opp = right_opp = 200
 
     if IS_FIRST_BOOT:
-        print("\n[PIT-WALL] Transmitting telemetry... Waking up IBM Granite AI (Cold-start ~15s)... Pace Car Active.\n")
+        print("\n[PIT-WALL] Cloud AI is booting (Takes 60-90s). Local Sub-Brain taking control of the race...\n")
 
+    # FIXED PROMPT: Removed hardcoded example numbers so the AI is forced to calculate.
     prompt = f"""
     You are an advanced autonomous racing AI.
     Speed: {current_speed:.1f} km/h | Track Position: {track_position:.2f} (-1 left, 1 right, 0 center)
@@ -461,12 +465,12 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
     Opponents - Left: {left_opp:.1f}m | Center: {center_opp:.1f}m | Right: {right_opp:.1f}m
 
     STRATEGY RULES:
-    1. target_speed: If Clear Track > 120m AND Center Opponent > 80m, output 140. If an opponent is blocking the center (< 50m), reduce speed to 90. If Clear Track < 60m, output 40.
-    2. target_lane: If Center Opponent < 60m, output 0.5 (shift right) if Right space > Left space, or -0.5 (shift left) if Left space > Right space. Otherwise, output 0.0.
+    1. target_speed: If Clear Track > 120m AND Center Opponent > 80m, value is 140.0. If Center Opponent < 50m, value is 90.0. If Clear Track < 60m, value is 40.0.
+    2. target_lane: If Center Opponent < 60m, value is 0.5 if Right space > Left space, or -0.5 if Left space > Right space. Otherwise, value is 0.0.
     3. brake_threshold & centering_gain: 0.9 and 0.15 for straights. 0.3 and 0.9 for sharp turns.
 
-    Output ONLY a valid JSON object matching this format exactly:
-    {{"target_speed": 140.0, "brake_threshold": 0.9, "centering_gain": 0.15, "target_lane": 0.0}}
+    Output ONLY a valid JSON object. Replace the brackets with your calculated numbers:
+    {{"target_speed": [speed], "brake_threshold": [brake], "centering_gain": [gain], "target_lane": [lane]}}
     """
     
     try:
@@ -487,9 +491,9 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
             CURRENT_STRATEGY_PARAMS["TARGET_LANE"] = float(data.get("target_lane", 0.0))
             
             IS_FIRST_BOOT = False 
-            print(f"\n[PIT-WALL] Clear: {safe_distance:.0f}m | Center Opp: {center_opp:.0f}m | Shift: {CURRENT_STRATEGY_PARAMS['TARGET_LANE']} | Speed Limit Requested: {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}\n")
+            print(f"\n[PIT-WALL] Clear: {safe_distance:.0f}m | Center Opp: {center_opp:.0f}m | Shift: {CURRENT_STRATEGY_PARAMS['TARGET_LANE']} | AI Speed Commanded: {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}\n")
         else:
-            print(f"\n[PIT-WALL] Invalid Payload Format Received\n")
+            print(f"\n[PIT-WALL] Invalid Payload Format Received: {response_text}\n")
             
     except Exception as e:
         print(f"\n[PIT-WALL] RADIO INTERFERENCE (API Error): {e}\n")
@@ -512,9 +516,35 @@ def ask_pit_wall_async(current_speed, track_position, track_radar, opponent_rada
 
 # ================= HELPER FUNCTIONS =================
 def calculate_steering(S):
+    global TARGET_LANE, CENTERING_GAIN, STEERING_INTEGRAL, PREV_STEERING_ERROR
+    
+    # 1. Calculate the Error Matrix (Position + Angle)
     lane_error = S.get('trackPos', 0) - TARGET_LANE
-    steer = (S.get('angle', 0) * 0.5 / math.pi) - (lane_error * CENTERING_GAIN)
-    return max(-1, min(1, steer))
+    angle_error = S.get('angle', 0) / math.pi
+    
+    # Total error combines how far off-center we are, and which way the nose is pointing
+    current_error = lane_error + angle_error
+    
+    # 2. PID Constants
+    Kp = CENTERING_GAIN  # Proportional (Dynamically controlled by IBM Granite)
+    Ki = 0.005           # Integral (Corrects long-term drifting on sweeping curves)
+    Kd = 0.25            # Derivative (Dampens the wobble/oscillation at high speeds)
+    
+    # 3. Integral Calculus (Accumulate past errors)
+    STEERING_INTEGRAL += current_error
+    # Anti-Windup Protocol: Prevent the integral from building up infinitely on hairpins
+    STEERING_INTEGRAL = max(-5.0, min(5.0, STEERING_INTEGRAL)) 
+    
+    # 4. Derivative Calculus (Predict future error rate)
+    derivative = current_error - PREV_STEERING_ERROR
+    
+    # 5. The Ultimate Steering Equation
+    steer = -(Kp * current_error) - (Ki * STEERING_INTEGRAL) - (Kd * derivative)
+    
+    # Save current state for the next 50Hz frame
+    PREV_STEERING_ERROR = current_error
+    
+    return max(-1.0, min(1.0, steer))
 
 def calculate_throttle(S, R):
     if S.get('speedX', 0) < TARGET_SPEED - (abs(R['steer']) * 1.5):
@@ -546,44 +576,41 @@ def drive_modular(c):
     
     S, R = c.S.d, c.R.d
     current_speed = S.get('speedX', 0)
+    track_radar = S.get('track', [200] * 19)
+    distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
     
     # ---------------------------------------------------------
     # SYSTEM 1: 3-PHASE KINEMATIC RECOVERY MACHINE
     # ---------------------------------------------------------
     if RECOVERY_STATE > 0:
         if RECOVERY_STATE > 80:
-            # PHASE 1: Full Stop (Kill all sliding momentum, frames 100-81)
             R['gear'] = 1; R['brake'] = 1.0; R['accel'] = 0.0; R['steer'] = 0.0
         elif RECOVERY_STATE > 40:
-            # PHASE 2: Inverted Reverse (Pull nose away from wall, frames 80-41)
             R['gear'] = -1; R['brake'] = 0.0; R['accel'] = 0.8
-            # In reverse, steering toward the wall pushes the nose away from it
             R['steer'] = math.copysign(1.0, S.get('trackPos', 0)) 
         else:
-            # PHASE 3: Forward Escape (Re-align to track, frames 40-1)
             R['gear'] = 1; R['brake'] = 0.0; R['accel'] = 0.8
             R['steer'] = -math.copysign(1.0, S.get('trackPos', 0)) 
             
         RECOVERY_STATE -= 1
-        return  # Bypass all other AI logic while surviving
+        return  
     
     # ---------------------------------------------------------
-    # SYSTEM 2: TELEMETRY & PACE CAR PROTOCOL
+    # SYSTEM 2: TELEMETRY & SUB-BRAIN PROTOCOL
     # ---------------------------------------------------------
-    track_radar = S.get('track', [200] * 19)
     opponent_radar = S.get('opponents', [200] * 36)
     ask_pit_wall_async(current_speed, S.get('trackPos', 0), track_radar, opponent_radar)
     
     if IS_FIRST_BOOT:
-        # PACE CAR MODE: Safe crawling while cloud AI boots up
-        TARGET_SPEED = 40.0
+        # THE DETERMINISTIC SUB-BRAIN: Actively race while waiting for the cloud
+        TARGET_SPEED = min(100.0, max(30.0, distance_ahead * 0.8)) # Dynamic radar speed
         BRAKE_THRESHOLD = 0.5
-        CENTERING_GAIN = 1.0
+        CENTERING_GAIN = 0.8
         TARGET_LANE = 0.0
     else:
-        # SYSTEM 3: THE HARDWARE GOVERNOR (Never trust the AI completely)
+        # THE HARDWARE GOVERNOR: Cap the AI
         ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80)
-        TARGET_SPEED = min(120.0, ai_speed)  # Hard physical cap at 120 km/h
+        TARGET_SPEED = min(120.0, ai_speed)  
         BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS.get("BRAKE_THRESHOLD", 0.5)
         CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
         TARGET_LANE = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
@@ -591,16 +618,13 @@ def drive_modular(c):
     # ---------------------------------------------------------
     # SYSTEM 4: VELOCITY-SCALED EMERGENCY BRAKING
     # ---------------------------------------------------------
-    distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
-    
-    # Braking physics: Require 0.9 meters of braking room per km/h
-    dynamic_brake_zone = max(50.0, current_speed * 0.9) 
+    dynamic_brake_zone = max(45.0, current_speed * 0.8) 
 
     if distance_ahead < dynamic_brake_zone or abs(S.get('trackPos', 0)) > 0.80:
         TARGET_SPEED = 30.0       
         CENTERING_GAIN = 1.0    
         if current_speed > 25:
-            R['brake'] = 1.0  # Maximum hydraulic pressure
+            R['brake'] = 1.0  
         else:
             R['brake'] = 0.0
 
@@ -609,8 +633,6 @@ def drive_modular(c):
     # ---------------------------------------------------------
     R['steer'] = calculate_steering(S)
     R['accel'] = calculate_throttle(S, R)
-    
-    # Apply brakes from standard logic, but don't override emergency braking
     normal_brake = apply_brakes(S)
     if R['brake'] < normal_brake:
         R['brake'] = normal_brake
@@ -618,9 +640,9 @@ def drive_modular(c):
     R['accel'] = traction_control(S, R['accel'])
     R['gear'] = shift_gears(S)
     
-    # TRIGGER 3-PHASE RECOVERY IF PARALYZED
+    # TRIGGER 3-PHASE RECOVERY
     if current_speed < 3 and abs(S.get('trackPos', 0)) > 0.7:
-        RECOVERY_STATE = 100  # Start the 100-frame (2-second) escape sequence
+        RECOVERY_STATE = 100  
         
     return
 
