@@ -432,7 +432,10 @@ RADIO_IS_BUSY = False
 IS_FIRST_BOOT = True  
 
 # NEW: THE TEMPORAL CONTEXT BUFFER
-TELEMETRY_HISTORY = []  # Stores the last 3 AI decisions to calculate momentum  
+TELEMETRY_HISTORY = []  # Stores the last 3 AI decisions to calculate momentum
+
+# NEW: HEURISTIC TRACK MAPPING
+TRACK_MEMORY = {}  # Maps the track segment to the corner severity
 
 # STATE MACHINE FOR RECOVERY
 RECOVERY_STATE = 0  
@@ -612,13 +615,33 @@ def shift_gears(S):
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
-    global TARGET_SPEED, BRAKE_THRESHOLD, CENTERING_GAIN, TARGET_LANE, RECOVERY_STATE
+    global TARGET_SPEED, BRAKE_THRESHOLD, CENTERING_GAIN, TARGET_LANE, RECOVERY_STATE, TRACK_MEMORY
     
     S, R = c.S.d, c.R.d
     current_speed = S.get('speedX', 0)
     track_radar = S.get('track', [200] * 19)
     distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
+    current_dist = S.get('distFromStart', 0)
     
+    # ---------------------------------------------------------
+    # SYSTEM 0: HEURISTIC TRACK MAPPING (THE SIXTH SENSE)
+    # ---------------------------------------------------------
+    dist_index = int(current_dist / 10) # Chunk the track into 10-meter blocks
+    
+    # Map the track: Record the tightest radar ping for this exact location
+    if dist_index not in TRACK_MEMORY or distance_ahead < TRACK_MEMORY[dist_index]:
+        TRACK_MEMORY[dist_index] = distance_ahead
+        
+    # Look into the future: Check our memory 40 to 120 meters ahead
+    effective_distance = distance_ahead
+    for look_ahead in range(4, 13): 
+        future_index = dist_index + look_ahead
+        if future_index in TRACK_MEMORY:
+            # If we remember a wall is 30m away when we are 50m further down the track,
+            # the effective true distance to that wall right now is 80m.
+            remembered_dist = TRACK_MEMORY[future_index] + (look_ahead * 10)
+            effective_distance = min(effective_distance, remembered_dist)
+
     # ---------------------------------------------------------
     # SYSTEM 1: 3-PHASE KINEMATIC RECOVERY MACHINE
     # ---------------------------------------------------------
@@ -642,13 +665,12 @@ def drive_modular(c):
     ask_pit_wall_async(current_speed, S.get('trackPos', 0), track_radar, opponent_radar)
     
     if IS_FIRST_BOOT:
-        # THE DETERMINISTIC SUB-BRAIN: Actively race while waiting for the cloud
-        TARGET_SPEED = min(100.0, max(30.0, distance_ahead * 0.8)) # Dynamic radar speed
+        # Actively race while waiting for the cloud (Using our memory!)
+        TARGET_SPEED = min(100.0, max(30.0, effective_distance * 0.8)) 
         BRAKE_THRESHOLD = 0.5
         CENTERING_GAIN = 0.8
         TARGET_LANE = 0.0
     else:
-        # THE HARDWARE GOVERNOR: Cap the AI
         ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80)
         TARGET_SPEED = min(120.0, ai_speed)  
         BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS.get("BRAKE_THRESHOLD", 0.5)
@@ -656,19 +678,18 @@ def drive_modular(c):
         TARGET_LANE = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
 
     # ---------------------------------------------------------
-    # SYSTEM 4: PROPORTIONAL CORNERING (Replaces Bang-Bang Brakes)
+    # SYSTEM 4: PREDICTIVE PROPORTIONAL CORNERING
     # ---------------------------------------------------------
+    # We now brake based on the FUTURE memory (effective_distance) 
+    # instead of just what the blind radar sees right now.
     dynamic_brake_zone = max(50.0, current_speed * 0.8) 
 
-    if distance_ahead < dynamic_brake_zone:
-        # Smoothly roll off the target speed as we get closer to the wall
-        speed_factor = max(0.3, distance_ahead / dynamic_brake_zone)
+    if effective_distance < dynamic_brake_zone:
+        speed_factor = max(0.3, effective_distance / dynamic_brake_zone)
         TARGET_SPEED = TARGET_SPEED * speed_factor
-        # Minimum cornering speed of 45 km/h so we NEVER crawl or stop
         TARGET_SPEED = max(45.0, TARGET_SPEED)
         CENTERING_GAIN = 1.0    
     elif abs(S.get('trackPos', 0)) > 0.75:
-        # Off-track panic mode
         TARGET_SPEED = 40.0
         CENTERING_GAIN = 1.2
 
