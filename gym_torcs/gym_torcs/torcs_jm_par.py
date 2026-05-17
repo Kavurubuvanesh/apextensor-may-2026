@@ -565,15 +565,41 @@ def calculate_steering(S):
     
     return max(-1.0, min(1.0, steer))
 
-def calculate_throttle(S, R):
-    if S.get('speedX', 0) < TARGET_SPEED - (abs(R['steer']) * 1.5):
-        accel = min(1.0, R['accel'] + 0.2)
+def calculate_pedals(S, target_speed, steer):
+    current_speed = S.get('speedX', 0)
+    speed_error = current_speed - target_speed
+    
+    accel = 0.0
+    brake = 0.0
+    
+    # 1. Proportional Speed Control (Eliminates the stutter)
+    if speed_error > 3.0:
+        # Too fast: Apply smooth braking proportional to how fast we are going
+        brake = min(1.0, speed_error / 25.0) 
+    elif speed_error < -2.0:
+        # Too slow: Apply smooth acceleration
+        accel = min(1.0, abs(speed_error) / 15.0)
     else:
-        accel = max(0.0, R['accel'] - 0.2)
-    return max(0.0, min(1.0, accel))
+        # Coasting Zone: If we are exactly at the target speed, just maintain momentum
+        accel = 0.05
+        
+    # 2. Trail Braking (Add a tiny bit of brake if we are turning hard to shift weight to the front tires)
+    if abs(steer) > 0.2 and current_speed > 40:
+        brake = max(brake, abs(steer) * 0.3)
 
-def apply_brakes(S):
-    return 0.3 if abs(S.get('angle', 0)) > BRAKE_THRESHOLD else 0.0
+    # 3. Dynamic Traction Control (Friction Circle)
+    wheel_speeds = S.get('wheelSpinVel', [0, 0, 0, 0])
+    if len(wheel_speeds) >= 4 and accel > 0:
+        front_speed = (wheel_speeds[0] + wheel_speeds[1]) / 2.0
+        rear_speed = (wheel_speeds[2] + wheel_speeds[3]) / 2.0
+        slip_delta = rear_speed - front_speed
+        
+        max_allowed_slip = max(0.5, 2.5 - (abs(steer) * 2.0))
+        if slip_delta > max_allowed_slip:
+            # Smoothly roll off the throttle if tires start spinning
+            accel = max(0.0, accel - ((slip_delta - max_allowed_slip) * 0.3))
+            
+    return accel, brake
 
 def shift_gears(S):
     gear = 1
@@ -583,33 +609,6 @@ def shift_gears(S):
             gear = i + 1
     return min(gear, 6)
 
-def traction_control(S, accel, steer):
-    # UPGRADE 3: Dynamic Slip-Angle Physics (The Friction Circle)
-    wheel_speeds = S.get('wheelSpinVel', [0, 0, 0, 0])
-    
-    if len(wheel_speeds) < 4:
-        return accel
-
-    # Calculate the exact delta between driven wheels (rear) and rolling wheels (front)
-    front_speed = (wheel_speeds[0] + wheel_speeds[1]) / 2.0
-    rear_speed = (wheel_speeds[2] + wheel_speeds[3]) / 2.0
-    slip_delta = rear_speed - front_speed
-
-    # 1. The Friction Circle calculation: The harder we steer, the less throttle we can use
-    steering_load = abs(steer)
-    
-    # Base allowed slip is 2.5 rad/s (straight line). As we steer, allowed slip drops to 0.5 rad/s
-    max_allowed_slip = 2.5 - (steering_load * 2.0)
-    max_allowed_slip = max(0.5, max_allowed_slip) 
-
-    # 2. Algorithmic Throttle Feathering
-    if slip_delta > max_allowed_slip:
-        # We are breaking traction! Attenuate the throttle aggressively
-        slip_severity = slip_delta - max_allowed_slip
-        # The worse the slip, the more we cut the gas
-        accel = accel - (slip_severity * 0.2) 
-        
-    return max(0.0, min(1.0, accel))
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
@@ -657,33 +656,30 @@ def drive_modular(c):
         TARGET_LANE = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
 
     # ---------------------------------------------------------
-    # SYSTEM 4: VELOCITY-SCALED EMERGENCY BRAKING
+    # SYSTEM 4: PROPORTIONAL CORNERING (Replaces Bang-Bang Brakes)
     # ---------------------------------------------------------
-    dynamic_brake_zone = max(45.0, current_speed * 0.8) 
+    dynamic_brake_zone = max(50.0, current_speed * 0.8) 
 
-    # THE CRITICAL FIX: Reset the brake pedal at the start of every physics frame
-    R['brake'] = 0.0 
-
-    if distance_ahead < dynamic_brake_zone or abs(S.get('trackPos', 0)) > 0.80:
-        TARGET_SPEED = 30.0       
+    if distance_ahead < dynamic_brake_zone:
+        # Smoothly roll off the target speed as we get closer to the wall
+        speed_factor = max(0.3, distance_ahead / dynamic_brake_zone)
+        TARGET_SPEED = TARGET_SPEED * speed_factor
+        # Minimum cornering speed of 45 km/h so we NEVER crawl or stop
+        TARGET_SPEED = max(45.0, TARGET_SPEED)
         CENTERING_GAIN = 1.0    
-        if current_speed > 25:
-            R['brake'] = 1.0  # Maximum hydraulic pressure
-        else:
-            R['brake'] = 0.0
+    elif abs(S.get('trackPos', 0)) > 0.75:
+        # Off-track panic mode
+        TARGET_SPEED = 40.0
+        CENTERING_GAIN = 1.2
 
     # ---------------------------------------------------------
     # SYSTEM 5: STANDARD KINEMATICS
     # ---------------------------------------------------------
     R['steer'] = calculate_steering(S)
-    R['accel'] = calculate_throttle(S, R)
     
-    # Apply normal turning brakes, but only if they are stronger than emergency brakes
-    normal_brake = apply_brakes(S)
-    if R['brake'] < normal_brake:
-        R['brake'] = normal_brake
-        
-    R['accel'] = traction_control(S, R['accel'], R['steer'])
+    # Fire the unified pedal matrix
+    R['accel'], R['brake'] = calculate_pedals(S, TARGET_SPEED, R['steer'])
+    
     R['gear'] = shift_gears(S)
     
     # TRIGGER 3-PHASE RECOVERY
