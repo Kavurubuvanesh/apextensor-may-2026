@@ -694,28 +694,31 @@ def drive_modular(c):
         CENTERING_GAIN = 1.2
 
     # ---------------------------------------------------------
-    # SYSTEM 5: DYNAMIC RACING LINE (The Anti-Snap Patch)
+    # SYSTEM 5: DYNAMIC RACING LINE (The True Apex Geometry)
     # ---------------------------------------------------------
     left_space = sum(track_radar[2:6])
     right_space = sum(track_radar[13:17])
     
     if abs(CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)) < 0.1:
-        if right_space > left_space + 50:  # Right Turn Detected
-            if effective_distance > 60:
-                TARGET_LANE = -0.4  # Gentle outside entry (Left)
-            elif effective_distance > 25:
-                TARGET_LANE = 0.5   # Smooth inside apex (Right, safely off the grass)
+        # THE FIX: If the left wall is further away, the track is curving RIGHT.
+        if left_space > right_space + 40:  # Right Turn Detected
+            if effective_distance > 50:
+                TARGET_LANE = -0.4  # Entry: Swing Left (Outside)
+            elif effective_distance > 15:
+                TARGET_LANE = 0.6   # Apex: Dive Right (Inside, aiming for the curbs)
             else:
-                TARGET_LANE = 0.0   # Track out on exit
-        elif left_space > right_space + 50:  # Left Turn Detected
-            if effective_distance > 60:
-                TARGET_LANE = 0.4   # Gentle outside entry (Right)
-            elif effective_distance > 25:
-                TARGET_LANE = -0.5  # Smooth inside apex (Left)
+                TARGET_LANE = 0.0   # Exit: Let momentum carry it back to center
+                
+        # THE FIX: If the right wall is further away, the track is curving LEFT.
+        elif right_space > left_space + 40:  # Left Turn Detected
+            if effective_distance > 50:
+                TARGET_LANE = 0.4   # Entry: Swing Right (Outside)
+            elif effective_distance > 15:
+                TARGET_LANE = -0.6  # Apex: Dive Left (Inside, aiming for the curbs)
             else:
                 TARGET_LANE = 0.0   
         else:
-            # Smoothly drift back to center on straights; no violent jerks
+            # Smoothly drift back to center on straights
             TARGET_LANE = TARGET_LANE * 0.8 
 
     # Execute Kinematics
