@@ -540,30 +540,32 @@ def ask_pit_wall_async(current_speed, track_position, track_radar, opponent_rada
     thread.start()
 
 # ================= HELPER FUNCTIONS =================
-def calculate_steering(S):
+def calculate_steering(S, current_speed):
     global TARGET_LANE, CENTERING_GAIN, STEERING_INTEGRAL, PREV_STEERING_ERROR
     
-    # 1. Spatial Error (Meters)
     lane_error = S.get('trackPos', 0) - TARGET_LANE
     
-    # 2. PID Constants
-    Kp = CENTERING_GAIN  
+    # UPGRADE 6: Velocity-Scheduled Gain Control
+    # Maps our speed from 0 to 1.0 (maxing out at 140 km/h)
+    speed_factor = max(0.0, min(1.0, current_speed / 140.0))
+    
+    # DYNAMIC CONSTANTS: 
+    # Kp decreases at high speed (less twitchy). 
+    # Kd increases at high speed (more dampening/stability).
+    Kp = CENTERING_GAIN * (1.5 - speed_factor)  
     Ki = 0.005           
-    Kd = 0.3             
+    Kd = 0.15 + (0.35 * speed_factor)           
     
-    # 3. Integral Calculus (Accumulate past drifting)
     STEERING_INTEGRAL += lane_error
-    STEERING_INTEGRAL = max(-2.0, min(2.0, STEERING_INTEGRAL)) # Anti-windup
+    STEERING_INTEGRAL = max(-2.0, min(2.0, STEERING_INTEGRAL)) 
     
-    # 4. Derivative Calculus (Predict future position)
     derivative = lane_error - PREV_STEERING_ERROR
     
-    # 5. The Ultimate Steering Equation (Align nose, then apply PID correction)
+    # Align nose, then apply the velocity-scaled PID correction
     base_alignment = S.get('angle', 0) * 0.5 / math.pi
     pid_correction = (Kp * lane_error) + (Ki * STEERING_INTEGRAL) + (Kd * derivative)
     
     steer = base_alignment - pid_correction
-    
     PREV_STEERING_ERROR = lane_error
     
     return max(-1.0, min(1.0, steer))
@@ -722,7 +724,7 @@ def drive_modular(c):
             TARGET_LANE = TARGET_LANE * 0.8 
 
     # Execute Kinematics
-    R['steer'] = calculate_steering(S)
+    R['steer'] = calculate_steering(S, current_speed)
     
     # Fire the unified pedal matrix
     R['accel'], R['brake'] = calculate_pedals(S, TARGET_SPEED, R['steer'])
