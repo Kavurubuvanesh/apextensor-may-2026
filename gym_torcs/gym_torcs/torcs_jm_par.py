@@ -434,9 +434,6 @@ IS_FIRST_BOOT = True
 # NEW: THE TEMPORAL CONTEXT BUFFER
 TELEMETRY_HISTORY = []  # Stores the last 3 AI decisions to calculate momentum
 
-# NEW: HEURISTIC TRACK MAPPING
-TRACK_MEMORY = {}  # Maps the track segment to the corner severity
-
 # STATE MACHINE FOR RECOVERY
 RECOVERY_STATE = 0  
 
@@ -617,33 +614,12 @@ def shift_gears(S):
 
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
-    global TARGET_SPEED, BRAKE_THRESHOLD, CENTERING_GAIN, TARGET_LANE, RECOVERY_STATE, TRACK_MEMORY
+    global TARGET_SPEED, BRAKE_THRESHOLD, CENTERING_GAIN, TARGET_LANE, RECOVERY_STATE
     
     S, R = c.S.d, c.R.d
     current_speed = S.get('speedX', 0)
     track_radar = S.get('track', [200] * 19)
-    distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
-    current_dist = S.get('distFromStart', 0)
     
-    # ---------------------------------------------------------
-    # SYSTEM 0: HEURISTIC TRACK MAPPING (THE SIXTH SENSE)
-    # ---------------------------------------------------------
-    dist_index = int(current_dist / 10) # Chunk the track into 10-meter blocks
-    
-    # Map the track: Record the tightest radar ping for this exact location
-    if dist_index not in TRACK_MEMORY or distance_ahead < TRACK_MEMORY[dist_index]:
-        TRACK_MEMORY[dist_index] = distance_ahead
-        
-    # Look into the future: Check our memory 40 to 120 meters ahead
-    effective_distance = distance_ahead
-    for look_ahead in range(4, 13): 
-        future_index = dist_index + look_ahead
-        if future_index in TRACK_MEMORY:
-            # If we remember a wall is 30m away when we are 50m further down the track,
-            # the effective true distance to that wall right now is 80m.
-            remembered_dist = TRACK_MEMORY[future_index] + (look_ahead * 10)
-            effective_distance = min(effective_distance, remembered_dist)
-
     # ---------------------------------------------------------
     # SYSTEM 1: 3-PHASE KINEMATIC RECOVERY MACHINE
     # ---------------------------------------------------------
@@ -661,77 +637,59 @@ def drive_modular(c):
         return  
     
     # ---------------------------------------------------------
-    # SYSTEM 2: TELEMETRY & SUB-BRAIN PROTOCOL
+    # SYSTEM 2: TELEMETRY & CLOUD ASYNC PROTOCOL
     # ---------------------------------------------------------
     opponent_radar = S.get('opponents', [200] * 36)
     ask_pit_wall_async(current_speed, S.get('trackPos', 0), track_radar, opponent_radar)
     
-    if IS_FIRST_BOOT:
-        # Actively race while waiting for the cloud (Using our memory!)
-        TARGET_SPEED = min(100.0, max(30.0, effective_distance * 0.8)) 
-        BRAKE_THRESHOLD = 0.5
-        CENTERING_GAIN = 0.8
-        TARGET_LANE = 0.0
+    # ---------------------------------------------------------
+    # SYSTEM 7: RAY-CAST APEX TARGETING & CURVATURE PHYSICS
+    # ---------------------------------------------------------
+    # The actual physical angles (in degrees) of the 19 TORCS radar sensors
+    sensor_angles = [-45, -19, -12, -7, -4, -2.5, -1.7, -1, -0.5, 0, 0.5, 1, 1.7, 2.5, 4, 7, 12, 19, 45]
+    
+    # 1. Find the Vanishing Point (Deepest visible part of the track)
+    max_dist = 0
+    target_idx = 9
+    for i in range(2, 17): # Scan a wide 70-degree forward cone
+        if track_radar[i] > max_dist:
+            max_dist = track_radar[i]
+            target_idx = i
+            
+    target_angle = sensor_angles[target_idx]
+    
+    # 2. Curvature Interpolation (Calculate the physical limit of the tires)
+    curvature_severity = min(1.0, abs(target_angle) / 19.0)
+    
+    theoretical_max_speed = 140.0
+    if curvature_severity > 0.05:
+        theoretical_max_speed = max(45.0, 140.0 - (curvature_severity * 95.0))
+
+    # 3. Velocity-Scaled Braking (Using the True Vanishing Point)
+    dynamic_brake_zone = max(40.0, current_speed * 0.8) 
+    
+    if max_dist < dynamic_brake_zone:
+        # Decelerate smoothly to the calculated cornering speed.
+        TARGET_SPEED = min(theoretical_max_speed, current_speed * 0.9)
+        CENTERING_GAIN = 1.0
     else:
-        ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80)
-        TARGET_SPEED = min(120.0, ai_speed)  
-        BRAKE_THRESHOLD = CURRENT_STRATEGY_PARAMS.get("BRAKE_THRESHOLD", 0.5)
+        # Clear track. Read AI speed, cap at physical limit.
+        ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80) if not IS_FIRST_BOOT else 100.0
+        TARGET_SPEED = min(120.0, min(ai_speed, theoretical_max_speed))
         CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
-        TARGET_LANE = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
+
+    # 4. Pure Pursuit Racing Line (Auto-Apex)
+    desired_lane = (target_angle / 19.0) * 0.8
+    TARGET_LANE = max(-0.65, min(0.65, desired_lane))
 
     # ---------------------------------------------------------
-    # SYSTEM 4: PREDICTIVE PROPORTIONAL CORNERING
+    # KINEMATICS EXECUTION
     # ---------------------------------------------------------
-    # We now brake based on the FUTURE memory (effective_distance) 
-    # instead of just what the blind radar sees right now.
-    dynamic_brake_zone = max(50.0, current_speed * 0.8) 
-
-    if effective_distance < dynamic_brake_zone:
-        speed_factor = max(0.3, effective_distance / dynamic_brake_zone)
-        TARGET_SPEED = TARGET_SPEED * speed_factor
-        TARGET_SPEED = max(45.0, TARGET_SPEED)
-        CENTERING_GAIN = 1.0    
-    elif abs(S.get('trackPos', 0)) > 0.75:
-        TARGET_SPEED = 40.0
-        CENTERING_GAIN = 1.2
-
-    # ---------------------------------------------------------
-    # SYSTEM 5: DYNAMIC RACING LINE (The True Apex Geometry)
-    # ---------------------------------------------------------
-    left_space = sum(track_radar[2:6])
-    right_space = sum(track_radar[13:17])
-    
-    if abs(CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)) < 0.1:
-        # THE FIX: If the left wall is further away, the track is curving RIGHT.
-        if left_space > right_space + 40:  # Right Turn Detected
-            if effective_distance > 50:
-                TARGET_LANE = -0.4  # Entry: Swing Left (Outside)
-            elif effective_distance > 15:
-                TARGET_LANE = 0.6   # Apex: Dive Right (Inside, aiming for the curbs)
-            else:
-                TARGET_LANE = 0.0   # Exit: Let momentum carry it back to center
-                
-        # THE FIX: If the right wall is further away, the track is curving LEFT.
-        elif right_space > left_space + 40:  # Left Turn Detected
-            if effective_distance > 50:
-                TARGET_LANE = 0.4   # Entry: Swing Right (Outside)
-            elif effective_distance > 15:
-                TARGET_LANE = -0.6  # Apex: Dive Left (Inside, aiming for the curbs)
-            else:
-                TARGET_LANE = 0.0   
-        else:
-            # Smoothly drift back to center on straights
-            TARGET_LANE = TARGET_LANE * 0.8 
-
-    # Execute Kinematics
     R['steer'] = calculate_steering(S, current_speed)
-    
-    # Fire the unified pedal matrix
     R['accel'], R['brake'] = calculate_pedals(S, TARGET_SPEED, R['steer'])
-    
     R['gear'] = shift_gears(S)
     
-    # TRIGGER 3-PHASE RECOVERY
+    # TRIGGER 3-PHASE RECOVERY (The Watchdog Tripwire)
     if current_speed < 3 and abs(S.get('trackPos', 0)) > 0.7:
         RECOVERY_STATE = 100  
         
