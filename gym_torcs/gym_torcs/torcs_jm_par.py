@@ -559,31 +559,41 @@ def calculate_steering(S, current_speed):
 
 def calculate_pedals(S, target_speed, steer):
     current_speed = S.get('speedX', 0)
-    speed_error = target_speed - current_speed # Positive means we need to speed up
+    speed_error = target_speed - current_speed 
     
     accel = 0.0
     brake = 0.0
     
-    # 1. Continuous Proportional Control (Smooth analog pedal blending)
+    # 1. Continuous Proportional Control
     if speed_error > 0:
-        accel = min(1.0, speed_error / 20.0) # Smooth roll-on throttle
+        accel = min(1.0, speed_error / 20.0) 
     else:
-        brake = min(1.0, abs(speed_error) / 30.0) # Smooth roll-on brake
+        brake = min(1.0, abs(speed_error) / 30.0) 
         
-    # 2. Trail Braking (Shift weight to front tires during hard cornering)
+    # 2. Trail Braking
     if abs(steer) > 0.2 and current_speed > 50:
         brake = max(brake, abs(steer) * 0.25)
 
-    # 3. Dynamic Traction Control (Friction Circle)
+    # 3. AERODYNAMIC TRACTION CONTROL (The Final Boss)
     wheel_speeds = S.get('wheelSpinVel', [0, 0, 0, 0])
     if len(wheel_speeds) >= 4 and accel > 0:
         front_speed = (wheel_speeds[0] + wheel_speeds[1]) / 2.0
         rear_speed = (wheel_speeds[2] + wheel_speeds[3]) / 2.0
         slip_delta = rear_speed - front_speed
         
-        max_allowed_slip = max(0.5, 2.5 - (abs(steer) * 2.0))
+        # Calculate Downforce: 0.0 at 0 km/h, scales up as speed increases
+        aero_downforce_factor = min(1.0, current_speed / 150.0)
+        
+        # Base slip limit increases dynamically as aero downforce presses the tires into the track
+        base_slip_limit = 2.0 + (2.0 * aero_downforce_factor)
+        
+        # Friction Circle: Reduce allowed longitudinal slip if we are steering hard
+        max_allowed_slip = max(0.5, base_slip_limit - (abs(steer) * 2.5))
+        
         if slip_delta > max_allowed_slip:
-            accel = max(0.0, accel - ((slip_delta - max_allowed_slip) * 0.3))
+            # Algorithmic throttle feathering to hover exactly on the edge of grip
+            slip_severity = slip_delta - max_allowed_slip
+            accel = max(0.0, accel - (slip_severity * 0.4))
             
     return accel, brake
 
