@@ -626,46 +626,60 @@ def drive_modular(c):
     ask_pit_wall_async(current_speed, S.get('trackPos', 0), track_radar, opponent_radar)
     
     # ---------------------------------------------------------
-    # SYSTEM 7: CONTINUOUS FLOW DYNAMIC RACING LINE
+    # SYSTEM 3 & 7: TACTICAL OVERTAKE & DYNAMIC RACING LINE
     # ---------------------------------------------------------
     left_space = sum(track_radar[2:6])
     right_space = sum(track_radar[13:17])
     forward_clearance = track_radar[9]
     
-    # 1. Calculate the DESIRED Lane
+    # Read the 36-sensor opponent radar (0 is front, moving counter-clockwise)
+    center_opp = min(opponent_radar[0], opponent_radar[1], opponent_radar[35]) if len(opponent_radar) >= 36 else 200
+    left_blind_spot = min(opponent_radar[2:9]) if len(opponent_radar) >= 36 else 200
+    right_blind_spot = min(opponent_radar[27:34]) if len(opponent_radar) >= 36 else 200
+
     desired_lane = 0.0
-    if abs(CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)) < 0.1:
+    
+    # 1. COLLISION AVOIDANCE & OVERTAKE PROTOCOL (Highest Priority Override)
+    if center_opp < 40.0:
+        if left_blind_spot > 15.0 and left_space > right_space:
+            desired_lane = -0.65  # Dive Left to overtake
+        elif right_blind_spot > 15.0:
+            desired_lane = 0.65   # Dive Right to overtake
+        else:
+            desired_lane = TARGET_LANE # Boxed in! Hold current line and prepare to brake.
+            
+    # 2. RACING LINE (If track is clear and AI hasn't commanded a lane)
+    elif abs(CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)) < 0.1:
         if left_space > right_space + 40:  # Right Turn
-            if forward_clearance > 60:
-                desired_lane = -0.5
-            elif forward_clearance > 20:
-                desired_lane = 0.5
+            if forward_clearance > 60: desired_lane = -0.5
+            elif forward_clearance > 20: desired_lane = 0.5
         elif right_space > left_space + 40:  # Left Turn
-            if forward_clearance > 60:
-                desired_lane = 0.5
-            elif forward_clearance > 20:
-                desired_lane = -0.5
+            if forward_clearance > 60: desired_lane = 0.5
+            elif forward_clearance > 20: desired_lane = -0.5
     else:
+        # 3. CLOUD STRATEGY COMMAND
         desired_lane = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
 
-    # THE LOW-PASS FILTER FIX (Smooth F1 Steering)
-    # This prevents the wheel from snapping. It glides to the target lane gracefully.
+    # LOW-PASS FILTER (Smooth F1 Steering)
     TARGET_LANE += (desired_lane - TARGET_LANE) * 0.1
 
-    # 2. Decoupled Velocity & Braking Limits
+    # 4. DECOUPLED VELOCITY LIMITS
     dynamic_brake_zone = max(50.0, current_speed * 0.8) 
-    
-    # Calculate base speed independent of current physics state
     ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80) if not IS_FIRST_BOOT else 115.0
     base_target_speed = min(130.0, ai_speed)
     
-    if forward_clearance < dynamic_brake_zone:
-        # THE FIX: Scale based on BASE speed, not current speed, killing the stutter feedback loop.
+    if center_opp < 30.0 and left_blind_spot <= 15.0 and right_blind_spot <= 15.0:
+        # THE FIX: We are boxed in by opponents. Emergency speed matching to avoid rear-ending.
+        TARGET_SPEED = current_speed * 0.8
+        CENTERING_GAIN = 1.0
+    elif forward_clearance < dynamic_brake_zone:
+        # Normal corner braking
         speed_factor = max(0.35, forward_clearance / dynamic_brake_zone)
         TARGET_SPEED = base_target_speed * speed_factor
-        TARGET_SPEED = max(50.0, TARGET_SPEED) # Keep momentum up in corners
+        TARGET_SPEED = max(50.0, TARGET_SPEED) 
         CENTERING_GAIN = 1.0  
     else:
+        # Full throttle
         TARGET_SPEED = base_target_speed
         CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
 
