@@ -694,26 +694,29 @@ def drive_modular(c):
         CENTERING_GAIN = 1.2
 
     # ---------------------------------------------------------
-    # SYSTEM 5: DYNAMIC RACING LINE & KINEMATICS
+    # SYSTEM 5: DYNAMIC RACING LINE (The Anti-Snap Patch)
     # ---------------------------------------------------------
-    # Analyze track asymmetry to detect upcoming corner direction
     left_space = sum(track_radar[2:6])
     right_space = sum(track_radar[13:17])
     
-    # Only execute racing line if the Cloud AI isn't forcing an overtake
     if abs(CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)) < 0.1:
-        if right_space > left_space + 40:  # Sweeping Right Turn Detected
-            if effective_distance > 45:
-                TARGET_LANE = -0.6  # Swing wide Left (Entry)
+        if right_space > left_space + 50:  # Right Turn Detected
+            if effective_distance > 60:
+                TARGET_LANE = -0.4  # Gentle outside entry (Left)
+            elif effective_distance > 25:
+                TARGET_LANE = 0.5   # Smooth inside apex (Right, safely off the grass)
             else:
-                TARGET_LANE = 0.8   # Dive for the Right Apex
-        elif left_space > right_space + 40:  # Sweeping Left Turn Detected
-            if effective_distance > 45:
-                TARGET_LANE = 0.6   # Swing wide Right (Entry)
+                TARGET_LANE = 0.0   # Track out on exit
+        elif left_space > right_space + 50:  # Left Turn Detected
+            if effective_distance > 60:
+                TARGET_LANE = 0.4   # Gentle outside entry (Right)
+            elif effective_distance > 25:
+                TARGET_LANE = -0.5  # Smooth inside apex (Left)
             else:
-                TARGET_LANE = -0.8  # Dive for the Left Apex
+                TARGET_LANE = 0.0   
         else:
-            TARGET_LANE = 0.0       # Hold center on straights
+            # Smoothly drift back to center on straights; no violent jerks
+            TARGET_LANE = TARGET_LANE * 0.8 
 
     # Execute Kinematics
     R['steer'] = calculate_steering(S)
