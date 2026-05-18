@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 
 # Load the secret API key from your .env file
 load_dotenv()
-PI= 3.14159265359
+PI = 3.14159265359
 
 data_size = 2**17
 
@@ -301,7 +301,7 @@ class ServerState():
                     cx='<'
                     if self.d.get(k, 0)<0: cx= '>'
                     strout= '%6.3f %s' % (self.d.get(k, 0), bargraph(self.d.get(k, 0)*-1,-1,1,50,cx))
-                elif k == 'stucktimer': # CRITICAL BUG FIX APPLIED HERE
+                elif k == 'stucktimer': 
                     stuck_val = self.d.get(k)
                     if stuck_val:
                         strout= '%3d %s' % (stuck_val, bargraph(stuck_val,0,300,50,"'"))
@@ -422,6 +422,7 @@ BRAKE_THRESHOLD = 0.5
 GEAR_SPEEDS = [0, 20, 40, 80, 100, 180]  
 ENABLE_TRACTION_CONTROL = True
 TARGET_LANE = 0.0
+
 # --- PID CONTROL STATE ---
 STEERING_INTEGRAL = 0.0
 PREV_STEERING_ERROR = 0.0 
@@ -430,9 +431,7 @@ PREV_STEERING_ERROR = 0.0
 LAST_AI_CALL = 0  
 RADIO_IS_BUSY = False  
 IS_FIRST_BOOT = True  
-
-# NEW: THE TEMPORAL CONTEXT BUFFER
-TELEMETRY_HISTORY = []  # Stores the last 3 AI decisions to calculate momentum
+TELEMETRY_HISTORY = []  
 
 # STATE MACHINE FOR RECOVERY
 RECOVERY_STATE = 0  
@@ -461,14 +460,12 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
     if IS_FIRST_BOOT:
         print("\n[PIT-WALL] Cloud AI is booting (Takes 60-90s). Local Sub-Brain taking control of the race...\n")
 
-    # Format the Temporal Memory Buffer for the AI
     history_text = "No history available (System Booting)."
     if TELEMETRY_HISTORY:
         history_text = ""
         for idx, (h_spd, h_pos, h_cmd) in enumerate(TELEMETRY_HISTORY):
             history_text += f"   - T-minus {(idx+1)*12.5}s: Speed {h_spd:.1f}, Pos {h_pos:.2f} | Commanded Speed: {h_cmd:.1f}\n"
 
-    # UPGRADED PROMPT: Now includes Time Context and Predictive Drift rules
     prompt = f"""
     You are an advanced autonomous racing AI.
     
@@ -507,9 +504,8 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
             CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"] = float(data.get("centering_gain", 0.5))
             CURRENT_STRATEGY_PARAMS["TARGET_LANE"] = float(data.get("target_lane", 0.0))
             
-            # UPGRADE 2: Update the Temporal Memory Buffer
             TELEMETRY_HISTORY.insert(0, (current_speed, track_position, CURRENT_STRATEGY_PARAMS["TARGET_SPEED"]))
-            if len(TELEMETRY_HISTORY) > 3:  # Only keep the last 3 cycles (37.5 seconds of memory)
+            if len(TELEMETRY_HISTORY) > 3:  
                 TELEMETRY_HISTORY.pop()
             
             IS_FIRST_BOOT = False 
@@ -542,13 +538,8 @@ def calculate_steering(S, current_speed):
     
     lane_error = S.get('trackPos', 0) - TARGET_LANE
     
-    # UPGRADE 6: Velocity-Scheduled Gain Control
-    # Maps our speed from 0 to 1.0 (maxing out at 140 km/h)
     speed_factor = max(0.0, min(1.0, current_speed / 140.0))
     
-    # DYNAMIC CONSTANTS: 
-    # Kp decreases at high speed (less twitchy). 
-    # Kd increases at high speed (more dampening/stability).
     Kp = CENTERING_GAIN * (1.5 - speed_factor)  
     Ki = 0.005           
     Kd = 0.15 + (0.35 * speed_factor)           
@@ -558,7 +549,6 @@ def calculate_steering(S, current_speed):
     
     derivative = lane_error - PREV_STEERING_ERROR
     
-    # Align nose, then apply the velocity-scaled PID correction
     base_alignment = S.get('angle', 0) * 0.5 / math.pi
     pid_correction = (Kp * lane_error) + (Ki * STEERING_INTEGRAL) + (Kd * derivative)
     
@@ -569,25 +559,20 @@ def calculate_steering(S, current_speed):
 
 def calculate_pedals(S, target_speed, steer):
     current_speed = S.get('speedX', 0)
-    speed_error = current_speed - target_speed
+    speed_error = target_speed - current_speed # Positive means we need to speed up
     
     accel = 0.0
     brake = 0.0
     
-    # 1. Proportional Speed Control (Eliminates the stutter)
-    if speed_error > 3.0:
-        # Too fast: Apply smooth braking proportional to how fast we are going
-        brake = min(1.0, speed_error / 25.0) 
-    elif speed_error < -2.0:
-        # Too slow: Apply smooth acceleration
-        accel = min(1.0, abs(speed_error) / 15.0)
+    # 1. Continuous Proportional Control (Smooth analog pedal blending)
+    if speed_error > 0:
+        accel = min(1.0, speed_error / 20.0) # Smooth roll-on throttle
     else:
-        # Coasting Zone: If we are exactly at the target speed, just maintain momentum
-        accel = 0.05
+        brake = min(1.0, abs(speed_error) / 30.0) # Smooth roll-on brake
         
-    # 2. Trail Braking (Add a tiny bit of brake if we are turning hard to shift weight to the front tires)
-    if abs(steer) > 0.2 and current_speed > 40:
-        brake = max(brake, abs(steer) * 0.3)
+    # 2. Trail Braking (Shift weight to front tires during hard cornering)
+    if abs(steer) > 0.2 and current_speed > 50:
+        brake = max(brake, abs(steer) * 0.25)
 
     # 3. Dynamic Traction Control (Friction Circle)
     wheel_speeds = S.get('wheelSpinVel', [0, 0, 0, 0])
@@ -598,7 +583,6 @@ def calculate_pedals(S, target_speed, steer):
         
         max_allowed_slip = max(0.5, 2.5 - (abs(steer) * 2.0))
         if slip_delta > max_allowed_slip:
-            # Smoothly roll off the throttle if tires start spinning
             accel = max(0.0, accel - ((slip_delta - max_allowed_slip) * 0.3))
             
     return accel, brake
@@ -611,14 +595,13 @@ def shift_gears(S):
             gear = i + 1
     return min(gear, 6)
 
-
 # ================= MAIN DRIVE FUNCTION =================
 def drive_modular(c):
     global TARGET_SPEED, BRAKE_THRESHOLD, CENTERING_GAIN, TARGET_LANE, RECOVERY_STATE
     
     S, R = c.S.d, c.R.d
     current_speed = S.get('speedX', 0)
-    track_radar = S.get('track', [200] * 19)
+    track_radar = S.get('track', [200] * 19) 
     
     # ---------------------------------------------------------
     # SYSTEM 1: 3-PHASE KINEMATIC RECOVERY MACHINE
@@ -643,44 +626,48 @@ def drive_modular(c):
     ask_pit_wall_async(current_speed, S.get('trackPos', 0), track_radar, opponent_radar)
     
     # ---------------------------------------------------------
-    # SYSTEM 7: RAY-CAST APEX TARGETING & CURVATURE PHYSICS
+    # SYSTEM 7: CONTINUOUS FLOW DYNAMIC RACING LINE
     # ---------------------------------------------------------
-    # The actual physical angles (in degrees) of the 19 TORCS radar sensors
-    sensor_angles = [-45, -19, -12, -7, -4, -2.5, -1.7, -1, -0.5, 0, 0.5, 1, 1.7, 2.5, 4, 7, 12, 19, 45]
+    left_space = sum(track_radar[2:6])
+    right_space = sum(track_radar[13:17])
+    forward_clearance = track_radar[9]
     
-    # 1. Find the Vanishing Point (Deepest visible part of the track)
-    max_dist = 0
-    target_idx = 9
-    for i in range(2, 17): # Scan a wide 70-degree forward cone
-        if track_radar[i] > max_dist:
-            max_dist = track_radar[i]
-            target_idx = i
-            
-    target_angle = sensor_angles[target_idx]
-    
-    # 2. Curvature Interpolation (Calculate the physical limit of the tires)
-    curvature_severity = min(1.0, abs(target_angle) / 19.0)
-    
-    theoretical_max_speed = 140.0
-    if curvature_severity > 0.05:
-        theoretical_max_speed = max(45.0, 140.0 - (curvature_severity * 95.0))
-
-    # 3. Velocity-Scaled Braking (Using the True Vanishing Point)
-    dynamic_brake_zone = max(40.0, current_speed * 0.8) 
-    
-    if max_dist < dynamic_brake_zone:
-        # Decelerate smoothly to the calculated cornering speed.
-        TARGET_SPEED = min(theoretical_max_speed, current_speed * 0.9)
-        CENTERING_GAIN = 1.0
+    # 1. Calculate the DESIRED Lane
+    desired_lane = 0.0
+    if abs(CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)) < 0.1:
+        if left_space > right_space + 40:  # Right Turn
+            if forward_clearance > 60:
+                desired_lane = -0.5
+            elif forward_clearance > 20:
+                desired_lane = 0.5
+        elif right_space > left_space + 40:  # Left Turn
+            if forward_clearance > 60:
+                desired_lane = 0.5
+            elif forward_clearance > 20:
+                desired_lane = -0.5
     else:
-        # Clear track. Read AI speed, cap at physical limit.
-        ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80) if not IS_FIRST_BOOT else 100.0
-        TARGET_SPEED = min(120.0, min(ai_speed, theoretical_max_speed))
-        CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
+        desired_lane = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
 
-    # 4. Pure Pursuit Racing Line (Auto-Apex)
-    desired_lane = (target_angle / 19.0) * 0.8
-    TARGET_LANE = max(-0.65, min(0.65, desired_lane))
+    # THE LOW-PASS FILTER FIX (Smooth F1 Steering)
+    # This prevents the wheel from snapping. It glides to the target lane gracefully.
+    TARGET_LANE += (desired_lane - TARGET_LANE) * 0.1
+
+    # 2. Decoupled Velocity & Braking Limits
+    dynamic_brake_zone = max(50.0, current_speed * 0.8) 
+    
+    # Calculate base speed independent of current physics state
+    ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80) if not IS_FIRST_BOOT else 115.0
+    base_target_speed = min(130.0, ai_speed)
+    
+    if forward_clearance < dynamic_brake_zone:
+        # THE FIX: Scale based on BASE speed, not current speed, killing the stutter feedback loop.
+        speed_factor = max(0.35, forward_clearance / dynamic_brake_zone)
+        TARGET_SPEED = base_target_speed * speed_factor
+        TARGET_SPEED = max(50.0, TARGET_SPEED) # Keep momentum up in corners
+        CENTERING_GAIN = 1.0  
+    else:
+        TARGET_SPEED = base_target_speed
+        CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
 
     # ---------------------------------------------------------
     # KINEMATICS EXECUTION
@@ -689,8 +676,7 @@ def drive_modular(c):
     R['accel'], R['brake'] = calculate_pedals(S, TARGET_SPEED, R['steer'])
     R['gear'] = shift_gears(S)
     
-    # TRIGGER 3-PHASE RECOVERY (The Watchdog Tripwire)
-    if current_speed < 3 and abs(S.get('trackPos', 0)) > 0.7:
+    if current_speed < 3 and abs(S.get('trackPos', 0)) > 0.7 and S.get('distRaced', 0) > 10:
         RECOVERY_STATE = 100  
         
     return
