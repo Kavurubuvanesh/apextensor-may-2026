@@ -673,24 +673,26 @@ def drive_modular(c):
     # LOW-PASS FILTER (Smooth F1 Steering)
     TARGET_LANE += (desired_lane - TARGET_LANE) * 0.1
 
-    # 4. DECOUPLED VELOCITY LIMITS
+    # 4. FULLY AUTONOMOUS LOCAL VELOCITY (Unshackled from Cloud Lag)
     dynamic_brake_zone = max(50.0, current_speed * 0.8) 
-    ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80) if not IS_FIRST_BOOT else 115.0
-    base_target_speed = min(130.0, ai_speed)
+    
+    # We ignore the Cloud AI's speed micromanagement. Let the local aero engine eat.
+    base_target_speed = 135.0 
     
     if center_opp < 30.0 and left_blind_spot <= 15.0 and right_blind_spot <= 15.0:
-        # THE FIX: We are boxed in by opponents. Emergency speed matching to avoid rear-ending.
+        # Emergency speed matching if boxed in
         TARGET_SPEED = current_speed * 0.8
         CENTERING_GAIN = 1.0
     elif forward_clearance < dynamic_brake_zone:
-        # Normal corner braking
+        # Reflex braking: Local engine dynamically calculates cornering speed
         speed_factor = max(0.35, forward_clearance / dynamic_brake_zone)
         TARGET_SPEED = base_target_speed * speed_factor
-        TARGET_SPEED = max(50.0, TARGET_SPEED) 
+        TARGET_SPEED = max(55.0, TARGET_SPEED) # Carry high momentum through apex
         CENTERING_GAIN = 1.0  
     else:
-        # Full throttle
+        # Clear track: Push to maximum aerodynamic potential
         TARGET_SPEED = base_target_speed
+        # We still listen to the Cloud AI for steering strategy (aggression)
         CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
 
     # ---------------------------------------------------------
