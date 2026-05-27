@@ -8,6 +8,8 @@ import copy
 import collections as col
 import os
 import time
+import requests
+import json
 
 
 class TorcsEnv:

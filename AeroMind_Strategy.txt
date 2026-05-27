@@ -1,0 +1,21 @@
+AeroMind F1 Tactical Racing Rulebook
+
+Section 1: Aerodynamic Slip and Traction Control
+
+Nominal Slip: 1.0 to 2.0 rad/s rear wheel slip is optimal for maintaining tire temperature and exit velocity.
+
+High Slip (Oversteer Warning): If rear wheel slip exceeds 2.5 rad/s, the car is losing lateral grip. The Race Engineer must command a reduction in CENTERING_GAIN to 0.4 and advise a smooth throttle lift to prevent a spin.
+
+Zero Slip (Cold Tires): If wheel slip is 0.0 rad/s, the car is not utilizing its aerodynamic downforce. Advise pushing the braking zone deeper.
+
+Section 2: Opponent Proximity and Overtaking
+
+Clear Track (Forward Clearance > 100m): Engage DRS (Drag Reduction System). Push base_target_speed to 135+ km/h. Maximize momentum.
+
+Boxed In (Center Opponent < 40m, Blind Spots < 15m): The car is trapped. Do not attempt an overtake. Command speed matching (80% of current speed) to avoid rear-ending. Wait for a sector with wider track limits.
+
+Overtake Window (Center Opponent < 40m, Blind Spot > 15m): Dive into the open lane. Command TARGET_LANE offset to -0.65 (Left) or +0.65 (Right) based on the largest blind spot clearance.
+
+Section 3: Corner Entry
+
+Hairpin Approach (Clearance < 55m): High-speed cornering requires downforce. Do not let speed drop below 50 km/h or the aerodynamic grip will vanish.

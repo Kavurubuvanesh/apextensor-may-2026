@@ -4,14 +4,11 @@ import getopt
 import os
 import time
 import threading
-import replicate
 import math
 import json
 import re
-from dotenv import load_dotenv
+import requests
 
-# Load the secret API key from your .env file
-load_dotenv()
 PI = 3.14159265359
 
 data_size = 2**17
@@ -443,10 +440,11 @@ CURRENT_STRATEGY_PARAMS = {
     "TARGET_LANE": 0.0
 }
 
-# CLOUD STRATEGY ENGINE
-def fetch_strategy_from_cloud(current_speed, track_position, track_radar, opponent_radar):
-    global CURRENT_STRATEGY_PARAMS, RADIO_IS_BUSY, IS_FIRST_BOOT, TELEMETRY_HISTORY
+# ================= LOCAL LANGFLOW STRATEGY ENGINE =================
+def fetch_strategy_from_langflow(current_speed, track_position, track_radar, opponent_radar):
+    global CURRENT_STRATEGY_PARAMS, RADIO_IS_BUSY, IS_FIRST_BOOT
     
+    # Calculate track clearances
     distance_ahead = track_radar[9] if len(track_radar) > 9 else 200
     safe_distance = 0 if distance_ahead == -1 else distance_ahead
     
@@ -458,63 +456,42 @@ def fetch_strategy_from_cloud(current_speed, track_position, track_radar, oppone
         center_opp = left_opp = right_opp = 200
 
     if IS_FIRST_BOOT:
-        print("\n[PIT-WALL] Cloud AI is booting (Takes 60-90s). Local Sub-Brain taking control of the race...\n")
+        print("\n[PIT-WALL] Local Granite AI booting... Sub-Brain taking control.\n")
+        IS_FIRST_BOOT = False
 
-    history_text = "No history available (System Booting)."
-    if TELEMETRY_HISTORY:
-        history_text = ""
-        for idx, (h_spd, h_pos, h_cmd) in enumerate(TELEMETRY_HISTORY):
-            history_text += f"   - T-minus {(idx+1)*12.5}s: Speed {h_spd:.1f}, Pos {h_pos:.2f} | Commanded Speed: {h_cmd:.1f}\n"
-
-    prompt = f"""
-    You are an advanced autonomous racing AI.
+    # 1. Format the telemetry into a string for Langflow
+    telemetry_string = f"SPEED: {current_speed:.1f} km/h | TRACK_POS: {track_position:.2f} | CLEAR_AHEAD: {safe_distance:.0f}m | OPPONENTS (L/C/R): {left_opp:.0f}m / {center_opp:.0f}m / {right_opp:.0f}m"
     
-    CURRENT STATE:
-    Speed: {current_speed:.1f} km/h | Track Position: {track_position:.2f} (-1 left, 1 right, 0 center)
-    Clear Track Ahead: {safe_distance:.1f}m
-    Opponents - Left: {left_opp:.1f}m | Center: {center_opp:.1f}m | Right: {right_opp:.1f}m
-
-    TEMPORAL MEMORY (Past 3 Cycles):
-    {history_text}
-
-    STRATEGY RULES:
-    1. target_speed: If Clear Track > 120m AND Center Opponent > 80m, value is 140.0. If Center Opponent < 50m, value is 90.0. If Clear Track < 60m, value is 40.0.
-    2. target_lane: If Center Opponent < 60m, value is 0.5 if Right space > Left space, or -0.5 if Left space > Right space. Otherwise, value is 0.0.
-    3. brake_threshold & centering_gain: 0.9 and 0.15 for straights. 0.3 and 0.9 for sharp turns.
-    4. PREDICTIVE MOMENTUM: Look at the Temporal Memory. If your past positions show you drifting further away from 0.0 over time, you MUST increase centering_gain to 0.8 to stop the slide.
-
-    Output ONLY a valid JSON object. Replace the brackets with your calculated numbers:
-    {{"target_speed": [speed], "brake_threshold": [brake], "centering_gain": [gain], "target_lane": [lane]}}
-    """
+    # 2. Ping your local Langflow server
+    api_url = "http://127.0.0.1:7860/api/v1/run/fd754380-baf6-44ab-bae3-703718e00b4d?stream=False"
+    payload = {
+        "input_value": telemetry_string,
+        "output_type": "chat",
+        "input_type": "chat"
+    }
     
     try:
-        output = replicate.run(
-            "ibm-granite/granite-3.1-8b-instruct", 
-            input={"prompt": prompt, "max_tokens": 200}
-        )
-        response_text = "".join(output).strip()
+        response = requests.post(api_url, json=payload, timeout=60.0)
+        data = response.json()
         
-        match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-            data = json.loads(json_str)
+        # Extract the radio message from the JSON payload
+        command = data['outputs'][0]['outputs'][0]['results']['message']['text']
+        print(f"\n[AEROMIND RADIO] {command}\n")
+        
+        # 3. Parse the English text to dynamically update the car's PID controller
+        import re
+        speed_match = re.search(r'speed.*?(\d+)', command, re.IGNORECASE)
+        if speed_match:
+            CURRENT_STRATEGY_PARAMS["TARGET_SPEED"] = float(speed_match.group(1))
             
-            CURRENT_STRATEGY_PARAMS["TARGET_SPEED"] = float(data.get("target_speed", 80))
-            CURRENT_STRATEGY_PARAMS["BRAKE_THRESHOLD"] = float(data.get("brake_threshold", 0.5))
-            CURRENT_STRATEGY_PARAMS["CENTERING_GAIN"] = float(data.get("centering_gain", 0.5))
-            CURRENT_STRATEGY_PARAMS["TARGET_LANE"] = float(data.get("target_lane", 0.0))
-            
-            TELEMETRY_HISTORY.insert(0, (current_speed, track_position, CURRENT_STRATEGY_PARAMS["TARGET_SPEED"]))
-            if len(TELEMETRY_HISTORY) > 3:  
-                TELEMETRY_HISTORY.pop()
-            
-            IS_FIRST_BOOT = False 
-            print(f"\n[PIT-WALL] Clear: {safe_distance:.0f}m | Pos: {track_position:.2f} | AI Speed Commanded: {CURRENT_STRATEGY_PARAMS['TARGET_SPEED']}\n")
-        else:
-            print(f"\n[PIT-WALL] Invalid Payload Format Received: {response_text}\n")
+        lane_match = re.search(r'TARGET_LANE.*?(-?\d+\.\d+)', command)
+        if lane_match:
+            CURRENT_STRATEGY_PARAMS["TARGET_LANE"] = float(lane_match.group(1))
             
     except Exception as e:
-        print(f"\n[PIT-WALL] RADIO INTERFERENCE (API Error): {e}\n")
+        print(f"\n[AEROMIND OFFLINE] Radio Interference: {e}")
+        if 'data' in locals():
+            print(f"RAW LANGFLOW RESPONSE: {data}\n")
     finally:
         RADIO_IS_BUSY = False
 
@@ -522,13 +499,15 @@ def ask_pit_wall_async(current_speed, track_position, track_radar, opponent_rada
     global LAST_AI_CALL, RADIO_IS_BUSY
     current_time = time.time()
     
-    if current_time - LAST_AI_CALL < 12.5 or RADIO_IS_BUSY:
+    # Ping the local AI every 4 seconds (much faster than the cloud!)
+    if current_time - LAST_AI_CALL < 4.0 or RADIO_IS_BUSY:
         return 
         
     LAST_AI_CALL = current_time
     RADIO_IS_BUSY = True  
     
-    thread = threading.Thread(target=fetch_strategy_from_cloud, args=(current_speed, track_position, track_radar, opponent_radar))
+    # Run the API call in a background thread so the car doesn't freeze while waiting
+    thread = threading.Thread(target=fetch_strategy_from_langflow, args=(current_speed, track_position, track_radar, opponent_radar))
     thread.daemon = True
     thread.start()
 
@@ -538,14 +517,20 @@ def calculate_steering(S, current_speed):
     
     lane_error = S.get('trackPos', 0) - TARGET_LANE
     
-    speed_factor = max(0.0, min(1.0, current_speed / 140.0))
+    # Speed factor dynamically changes how the car steers based on velocity
+    speed_factor = max(0.0, min(1.0, current_speed / 150.0))
     
-    Kp = CENTERING_GAIN * (1.5 - speed_factor)  
-    Ki = 0.005           
-    Kd = 0.15 + (0.35 * speed_factor)           
+    # THE ZIG-ZAG FIX: 
+    # Kp (Proportional) is lowered so it doesn't jerk the wheel.
+    Kp = CENTERING_GAIN * (1.0 - (speed_factor * 0.3))  
+    Ki = 0.001           
+    
+    # Kd (Derivative) is MASSIVELY increased at high speeds. 
+    # This acts as a dampener that stops the steering wheel before it overshoots the center.
+    Kd = 0.25 + (0.5 * speed_factor)           
     
     STEERING_INTEGRAL += lane_error
-    STEERING_INTEGRAL = max(-2.0, min(2.0, STEERING_INTEGRAL)) 
+    STEERING_INTEGRAL = max(-1.0, min(1.0, STEERING_INTEGRAL)) 
     
     derivative = lane_error - PREV_STEERING_ERROR
     
@@ -555,6 +540,7 @@ def calculate_steering(S, current_speed):
     steer = base_alignment - pid_correction
     PREV_STEERING_ERROR = lane_error
     
+    # Smooth the final steering output
     return max(-1.0, min(1.0, steer))
 
 def calculate_pedals(S, target_speed, steer):
@@ -564,34 +550,36 @@ def calculate_pedals(S, target_speed, steer):
     accel = 0.0
     brake = 0.0
     
-    # 1. Continuous Proportional Control
-    if speed_error > 0:
-        accel = min(1.0, speed_error / 20.0) 
+    # 1. THE COASTING DEADBAND (Fixes constant braking on straights)
+    if speed_error > 2.0:
+        # We need speed. Accelerate smoothly.
+        accel = min(1.0, speed_error / 15.0) 
+    elif speed_error < -5.0:
+        # We are going WAY too fast. Apply brakes.
+        brake = min(1.0, abs(speed_error) / 25.0) 
     else:
-        brake = min(1.0, abs(speed_error) / 30.0) 
+        # The Sweet Spot: If we are within -5 to +2 km/h of the target, COAST.
+        # This stops the robotic micro-braking on straightaways.
+        accel = 0.0
+        brake = 0.0
         
-    # 2. Trail Braking
-    if abs(steer) > 0.2 and current_speed > 50:
-        brake = max(brake, abs(steer) * 0.25)
+    # 2. Trail Braking (Only brake in corners if we are carrying dangerous speed)
+    if abs(steer) > 0.3 and current_speed > 70:
+        brake = max(brake, abs(steer) * 0.3)
 
-    # 3. AERODYNAMIC TRACTION CONTROL (The Final Boss)
+    # 3. Aerodynamic Traction Control
     wheel_speeds = S.get('wheelSpinVel', [0, 0, 0, 0])
     if len(wheel_speeds) >= 4 and accel > 0:
         front_speed = (wheel_speeds[0] + wheel_speeds[1]) / 2.0
         rear_speed = (wheel_speeds[2] + wheel_speeds[3]) / 2.0
         slip_delta = rear_speed - front_speed
         
-        # Calculate Downforce: 0.0 at 0 km/h, scales up as speed increases
         aero_downforce_factor = min(1.0, current_speed / 150.0)
+        base_slip_limit = 2.0 + (1.5 * aero_downforce_factor) # Increased slip limit so it doesn't bog down
         
-        # Base slip limit increases dynamically as aero downforce presses the tires into the track
-        base_slip_limit = 2.0 + (2.0 * aero_downforce_factor)
-        
-        # Friction Circle: Reduce allowed longitudinal slip if we are steering hard
-        max_allowed_slip = max(0.5, base_slip_limit - (abs(steer) * 2.5))
+        max_allowed_slip = max(1.0, base_slip_limit - (abs(steer) * 1.5))
         
         if slip_delta > max_allowed_slip:
-            # Algorithmic throttle feathering to hover exactly on the edge of grip
             slip_severity = slip_delta - max_allowed_slip
             accel = max(0.0, accel - (slip_severity * 0.4))
             
@@ -612,10 +600,9 @@ def drive_modular(c):
     S, R = c.S.d, c.R.d
     current_speed = S.get('speedX', 0)
     track_radar = S.get('track', [200] * 19) 
+    car_angle = S.get('angle', 0)
     
-    # ---------------------------------------------------------
-    # SYSTEM 1: 3-PHASE KINEMATIC RECOVERY MACHINE
-    # ---------------------------------------------------------
+    # SYSTEM 1: 3-PHASE RECOVERY
     if RECOVERY_STATE > 0:
         if RECOVERY_STATE > 80:
             R['gear'] = 1; R['brake'] = 1.0; R['accel'] = 0.0; R['steer'] = 0.0
@@ -625,86 +612,89 @@ def drive_modular(c):
         else:
             R['gear'] = 1; R['brake'] = 0.0; R['accel'] = 0.8
             R['steer'] = -math.copysign(1.0, S.get('trackPos', 0)) 
-            
         RECOVERY_STATE -= 1
         return  
+
+    # SYSTEM 1.5: ANTI-DONUT J-TURN
+    if abs(car_angle) > 1.7 and RECOVERY_STATE == 0:
+        RECOVERY_STATE = 80
+        return
     
-    # ---------------------------------------------------------
-    # SYSTEM 2: TELEMETRY & CLOUD ASYNC PROTOCOL
-    # ---------------------------------------------------------
+    # SYSTEM 2: LOCAL LANGFLOW AI
     opponent_radar = S.get('opponents', [200] * 36)
     ask_pit_wall_async(current_speed, S.get('trackPos', 0), track_radar, opponent_radar)
     
-    # ---------------------------------------------------------
-    # SYSTEM 3 & 7: TACTICAL OVERTAKE & DYNAMIC RACING LINE
-    # ---------------------------------------------------------
+    # SYSTEM 3 & 7: TACTICAL OVERTAKE & RACING LINE
     left_space = sum(track_radar[2:6])
     right_space = sum(track_radar[13:17])
     forward_clearance = track_radar[9]
     
-    # Read the 36-sensor opponent radar (0 is front, moving counter-clockwise)
     center_opp = min(opponent_radar[0], opponent_radar[1], opponent_radar[35]) if len(opponent_radar) >= 36 else 200
     left_blind_spot = min(opponent_radar[2:9]) if len(opponent_radar) >= 36 else 200
     right_blind_spot = min(opponent_radar[27:34]) if len(opponent_radar) >= 36 else 200
 
     desired_lane = 0.0
     
-    # 1. COLLISION AVOIDANCE & OVERTAKE PROTOCOL (Highest Priority Override)
     if center_opp < 40.0:
         if left_blind_spot > 15.0 and left_space > right_space:
-            desired_lane = -0.65  # Dive Left to overtake
+            desired_lane = -0.65  
         elif right_blind_spot > 15.0:
-            desired_lane = 0.65   # Dive Right to overtake
+            desired_lane = 0.65   
         else:
-            desired_lane = TARGET_LANE # Boxed in! Hold current line and prepare to brake.
-            
-    # 2. RACING LINE (If track is clear and AI hasn't commanded a lane)
+            desired_lane = TARGET_LANE 
     elif abs(CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)) < 0.1:
-        if left_space > right_space + 40:  # Right Turn
+        if left_space > right_space + 40: 
             if forward_clearance > 60: desired_lane = -0.5
             elif forward_clearance > 20: desired_lane = 0.5
-        elif right_space > left_space + 40:  # Left Turn
+        elif right_space > left_space + 40: 
             if forward_clearance > 60: desired_lane = 0.5
             elif forward_clearance > 20: desired_lane = -0.5
     else:
-        # 3. CLOUD STRATEGY COMMAND
         desired_lane = CURRENT_STRATEGY_PARAMS.get("TARGET_LANE", 0.0)
 
-    # LOW-PASS FILTER (Smooth F1 Steering)
     TARGET_LANE += (desired_lane - TARGET_LANE) * 0.1
 
-    # 4. FULLY AUTONOMOUS LOCAL VELOCITY (Unshackled from Cloud Lag)
-    dynamic_brake_zone = max(50.0, current_speed * 0.8) 
+    # SYSTEM 4: HYBRID DRS & OPTIMIZED BRAKING (Restored to 2:53 stable)
+    dynamic_brake_zone = max(55.0, current_speed * 1.0) 
+    ai_speed = CURRENT_STRATEGY_PARAMS.get("TARGET_SPEED", 80) if not IS_FIRST_BOOT else 115.0
     
-    # We ignore the Cloud AI's speed micromanagement. Let the local aero engine eat.
-    base_target_speed = 135.0 
+    if forward_clearance > 100 and abs(left_space - right_space) < 40:
+        base_target_speed = 135.0
+    else:
+        base_target_speed = max(70.0, min(125.0, ai_speed))
     
     if center_opp < 30.0 and left_blind_spot <= 15.0 and right_blind_spot <= 15.0:
-        # Emergency speed matching if boxed in
         TARGET_SPEED = current_speed * 0.8
         CENTERING_GAIN = 1.0
     elif forward_clearance < dynamic_brake_zone:
-        # Reflex braking: Local engine dynamically calculates cornering speed
         speed_factor = max(0.35, forward_clearance / dynamic_brake_zone)
         TARGET_SPEED = base_target_speed * speed_factor
-        TARGET_SPEED = max(55.0, TARGET_SPEED) # Carry high momentum through apex
+        TARGET_SPEED = max(50.0, min(base_target_speed, TARGET_SPEED)) 
         CENTERING_GAIN = 1.0  
     else:
-        # Clear track: Push to maximum aerodynamic potential
         TARGET_SPEED = base_target_speed
-        # We still listen to the Cloud AI for steering strategy (aggression)
         CENTERING_GAIN = CURRENT_STRATEGY_PARAMS.get("CENTERING_GAIN", 0.5)
 
-    # ---------------------------------------------------------
-    # KINEMATICS EXECUTION
-    # ---------------------------------------------------------
+    # KINEMATICS
     R['steer'] = calculate_steering(S, current_speed)
     R['accel'], R['brake'] = calculate_pedals(S, TARGET_SPEED, R['steer'])
     R['gear'] = shift_gears(S)
     
-    if current_speed < 3 and abs(S.get('trackPos', 0)) > 0.7 and S.get('distRaced', 0) > 10:
-        RECOVERY_STATE = 100  
-        
+    # ==========================================
+    # SYSTEM 0: EDGE REFLEX OVERRIDE (ANTI-CRASH)
+    # Physics doesn't wait for LLM latency. If we are < 45 meters 
+    # from a wall and carrying too much speed, override the AI and slam the brakes.
+    # ==========================================
+    if forward_clearance < 45.0 and current_speed > 60.0:
+        R['accel'] = 0.0
+        R['brake'] = 1.0
+        # Optional: Print a warning so you know the local reflex kicked in
+        # print(f"[EDGE REFLEX] Wall proximity alert! Overriding LLM.")
+    
+    if (current_speed < 3 and abs(S.get('trackPos', 0)) > 0.7 and S.get('distRaced', 0) > 10) or S.get('stucktimer', 0) > 60:
+        if RECOVERY_STATE == 0:
+            RECOVERY_STATE = 100  
+            
     return
 
 # ================= MAIN LOOP =================
